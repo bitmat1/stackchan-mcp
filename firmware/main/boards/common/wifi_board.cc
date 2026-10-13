@@ -10,6 +10,8 @@
 #include <freertos/task.h>
 #include <esp_network.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
+#include <esp_timer.h>
 #include <utility>
 
 #include <font_awesome.h>
@@ -339,7 +341,17 @@ std::string WifiBoard::GetDeviceStatusJson() {
     int rssi = wifi.GetRssi();
     const char* signal = rssi >= -60 ? "strong" : (rssi >= -70 ? "medium" : "weak");
     cJSON_AddStringToObject(network, "signal", signal);
+    cJSON_AddNumberToObject(network, "rssi", rssi);
     cJSON_AddItemToObject(root, "network", network);
+
+    // Memory and uptime, for health displays
+    auto system = cJSON_CreateObject();
+    cJSON_AddNumberToObject(system, "free_internal_kb", heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
+    cJSON_AddNumberToObject(system, "min_free_internal_kb",
+                            heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024);
+    cJSON_AddNumberToObject(system, "free_psram_kb", heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+    cJSON_AddNumberToObject(system, "uptime_s", static_cast<double>(esp_timer_get_time() / 1000000));
+    cJSON_AddItemToObject(root, "system", system);
 
     // Chip temperature
     float temp = 0.0f;

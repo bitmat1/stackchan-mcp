@@ -11,6 +11,20 @@
 
 #define TAG "CustomWakeWord"
 
+#if CONFIG_CUSTOM_WAKE_WORD_DROP_G2P
+#include <cstdlib>
+#include <cstring>
+// Stands in for esp-sr's flite_g2p so the linker never pulls in its ~600 KB
+// lexicon (MultiNet7 references it even when commands carry phonemes).
+// Callers free() the result; an empty string makes MultiNet reject the
+// command instead of crashing.
+extern "C" char* flite_g2p(const char* graphemes, int map_phonemes) {
+    ESP_LOGE("CustomWakeWord", "G2P was left out of this build; '%s' needs phonemes",
+             graphemes ? graphemes : "");
+    return static_cast<char*>(calloc(1, 1));
+}
+#endif
+
 CustomWakeWord::CustomWakeWord()
     : wake_word_pcm_(), wake_word_opus_() {
 }
@@ -119,8 +133,20 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
     multinet_model_data_ = multinet_->create(mn_name_, duration_);
     multinet_->set_det_threshold(multinet_model_data_, threshold_);
     esp_mn_commands_clear();
+#ifdef CONFIG_CUSTOM_WAKE_WORD_PHONEMES
+    constexpr bool kHavePhonemes = sizeof(CONFIG_CUSTOM_WAKE_WORD_PHONEMES) > 1;
+#else
+    constexpr bool kHavePhonemes = false;
+#endif
     for (int i = 0; i < commands_.size(); i++) {
-        esp_mn_commands_add(i + 1, commands_[i].command.c_str());
+        if constexpr (kHavePhonemes) {
+#ifdef CONFIG_CUSTOM_WAKE_WORD_PHONEMES
+            esp_mn_commands_phoneme_add(i + 1, commands_[i].command.c_str(),
+                                        CONFIG_CUSTOM_WAKE_WORD_PHONEMES);
+#endif
+        } else {
+            esp_mn_commands_add(i + 1, commands_[i].command.c_str());
+        }
     }
     esp_mn_commands_update();
     
