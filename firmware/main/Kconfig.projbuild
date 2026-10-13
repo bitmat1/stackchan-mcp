@@ -879,6 +879,25 @@ config CUSTOM_WAKE_WORD_DISPLAY
     help
         Greeting sent to the server after wake word detection
 
+config CUSTOM_WAKE_WORD_PHONEMES
+    string "Custom Wake Word phonemes (English MultiNet7)"
+    default ""
+    depends on USE_CUSTOM_WAKE_WORD
+    help
+        Phonemes for every wake-word command, as printed by
+        esp-sr/tool/multinet_g2p.py (e.g. "hd RbBnT" for "hey robot").
+        When set, commands are added with esp_mn_commands_phoneme_add.
+
+config CUSTOM_WAKE_WORD_DROP_G2P
+    bool "Leave the Flite G2P lexicon out of the firmware"
+    default n
+    depends on USE_CUSTOM_WAKE_WORD && CUSTOM_WAKE_WORD_PHONEMES != ""
+    help
+        MultiNet7 still references the English grapheme-to-phoneme library
+        (~600 KB of flash) even when every command comes with phonemes. This
+        provides a stub flite_g2p so the library is never linked. Only
+        commands with precomputed phonemes work.
+
 config CUSTOM_WAKE_WORD_THRESHOLD
     int "Custom Wake Word Threshold (%)"
     default 20
@@ -1108,7 +1127,174 @@ choice STACKCHAN_SERVO_DRIVER
             the tree as an opt-in fallback in case a regression is
             discovered with the MIT driver during the #79 observation
             period. Scheduled for removal in Phase B of the migration.
+
+    config STACKCHAN_SERVO_DYNAMIXEL
+        bool "DYNAMIXEL XL330 (Stack-chan RT ver.)"
+        help
+            Use the MIT DYNAMIXEL Protocol 2.0 driver vendored at
+            firmware/components/dynamixel_bus/ for rt-net's Stack-chan RT
+            ver. (two XL330-M288-T on a half-duplex bus, 1 Mbps). Also
+            swaps the servo UART pins to the RT board's TX=7 / RX=6.
 endchoice
+
+if STACKCHAN_SERVO_DYNAMIXEL
+
+config STACKCHAN_DXL_YAW_INVERT
+    bool "Invert DYNAMIXEL yaw direction"
+    default n
+    help
+        Flip if a positive yaw turns the head the opposite way to the
+        official kit.
+
+config STACKCHAN_DXL_PITCH_INVERT
+    bool "Invert DYNAMIXEL pitch direction"
+    default n
+    help
+        Flip if a higher pitch makes the head look down instead of up.
+
+config STACKCHAN_DXL_PITCH_UP_DEG
+    int "Head tilt-up limit in degrees"
+    default 30
+    range 5 60
+    help
+        How far the RT head tilts up at the firmware's maximum pitch (88).
+        rt-net's firmware clamps tilt-up at 30 degrees.
+
+config STACKCHAN_DXL_PITCH_DOWN_DEG
+    int "Head tilt-down limit in degrees"
+    default 10
+    range 0 45
+    help
+        How far the RT head tilts down at the firmware's minimum pitch (0).
+        rt-net's firmware clamps tilt-down at 10 degrees.
+
+config STACKCHAN_DXL_YAW_GOAL_CURRENT_MA
+    int "Yaw servo current limit (mA)"
+    default 100
+    range 10 1750
+    help
+        Goal Current in current-based position mode. rt-net's firmware
+        saturates pan current at 80 mA, which keeps the head gentle.
+
+config STACKCHAN_DXL_PITCH_GOAL_CURRENT_MA
+    int "Pitch servo current limit (mA)"
+    default 800
+    range 10 1750
+    help
+        Goal Current for the tilt servo, which has to hold the head
+        against gravity. rt-net's firmware saturates tilt at 800 mA.
+
+endif
+
+config LISTEN_AUTO_STOP_MAX_MS
+    int "Max listening time after wake word / tap (ms, 0 = off)"
+    default 0
+    range 0 120000
+    help
+        Stop device-initiated listening after this long even if the user
+        keeps talking. Gateway-driven listen() calls are not affected.
+
+config LISTEN_AUTO_STOP_SILENCE_MS
+    int "Stop listening after this much silence (ms, 0 = off)"
+    default 0
+    range 0 30000
+    help
+        Once speech has been detected, stop device-initiated listening
+        after this long without voice activity (AFE VAD).
+
+config STACKCHAN_SKIP_CLOUD_CHECK
+    bool "Skip the xiaozhi cloud OTA / activation check"
+    default n
+    help
+        Do not contact the xiaozhi OTA server at boot. Without this, a
+        device that was never bound to a xiaozhi.me account loops on an
+        activation code screen and never reaches the local gateway.
+        Firmware updates then come only from flashing.
+
+config STACKCHAN_PROCEDURAL_FACE
+    bool "Procedurally drawn face with extended expressions"
+    default n
+    help
+        Draw the avatar from parts (eyes, brows, mouth, overlays) instead of
+        the six built-in images, adding expressions such as laughing, love,
+        wink, angry, confused, sleepy and dizzy. Uses two 150 KB PSRAM
+        frame buffers. A custom set loaded with load_avatar_set still takes
+        precedence. See firmware/components/procedural_face/.
+
+config STACKCHAN_PITCH_LIMITS
+    bool "Override the head pitch range"
+    default n
+    help
+        Replace the official kit's pitch clamp (0..88, recommended 5..85)
+        with this robot's mechanical range.
+
+if STACKCHAN_PITCH_LIMITS
+config STACKCHAN_PITCH_MIN
+    int "Lowest pitch (degrees, kit scale)"
+    default 5
+    range 0 90
+config STACKCHAN_PITCH_MAX
+    int "Highest pitch (degrees, kit scale)"
+    default 85
+    range 0 90
+endif
+
+config STACKCHAN_LCD_PCLK_MHZ
+    int "LCD SPI clock (MHz)"
+    default 40
+    range 10 80
+    help
+        ILI9342 SPI write clock. Lower is more robust against signal
+        glitches that can knock the panel into a dark state; 20 MHz still
+        moves a full 320x240 frame in about 60 ms.
+
+config STACKCHAN_LCD_WEAK_DRIVE
+    bool "Use the weakest GPIO drive strength for the LCD SPI pins"
+    default n
+    help
+        Reduces edge rate on MOSI / SCLK / D/C / CS to cut crosstalk into
+        the D/C line, which can otherwise turn pixel data into stray panel
+        commands during busy full-screen animation.
+
+config STACKCHAN_DIAGNOSTIC_TOOLS
+    bool "Expose diagnostic MCP tools"
+    default n
+    help
+        Adds get_face_stats, get_task_stats, set_wake_word, set_lcd_refresh
+        and the SCS0009-era gpio_test / uart_diag / check_vm_en tools. Off by
+        default: each registered tool costs internal RAM.
+
+config STACKCHAN_BODY_SENSORS
+    bool "Report IMU (BMI270) and proximity (LTR-553) events"
+    default y
+    help
+        Polls the CoreS3's on-board IMU and proximity sensor and sends
+        stackchan-events (imu: picked_up / put_down / shake / tilted,
+        proximity: near / far) to the gateway. Also adds get_motion and
+        get_proximity tools.
+
+config STACKCHAN_CLOCK_SCREENSAVER_SECONDS
+    int "Show a clock after this many idle seconds (0 = off)"
+    default 0
+    range 0 86400
+    help
+        Cover the face with a large clock (time from pool.ntp.org) when
+        nothing has happened for this long. Speech, touch, a wake word or
+        any face change removes it.
+
+config STACKCHAN_TIMEZONE
+    string "POSIX TZ string for the clock"
+    default "UTC0"
+    help
+        e.g. "WET0WEST,M3.5.0/1,M10.5.0" for Lisbon / London-style DST.
+
+config STACKCHAN_REST_PITCH_DEG
+    int "Head rest pitch (degrees, 45 = level)"
+    default 45
+    range 5 85
+    help
+        Pitch the head returns to at boot. Higher looks further up
+        (official-kit scale: 45 is level, 85 is the recommended maximum).
 
 config STACKCHAN_SERVO_DELEGATED_MOTION
     bool "Use SCS0009 delegated motion timing"

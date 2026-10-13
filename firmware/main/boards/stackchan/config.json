@@ -11,6 +11,38 @@
                 "CONFIG_CAMERA_GC0308_DVP_YUV422_320X240_20FPS=y",
                 "CONFIG_STACKCHAN_SERVO_FEETECH=y"
             ]
+        },
+        {
+            "name": "stackchan-rt",
+            "sdkconfig_append": [
+                "CONFIG_STACKCHAN_MDNS_DISCOVERY=y",
+                "CONFIG_SPIRAM_MODE_QUAD=y",
+                "CONFIG_CAMERA_GC0308=y",
+                "CONFIG_CAMERA_GC0308_AUTO_DETECT_DVP_INTERFACE_SENSOR=y",
+                "CONFIG_CAMERA_GC0308_DVP_YUV422_320X240_20FPS=y",
+                "CONFIG_STACKCHAN_SERVO_DYNAMIXEL=y",
+                "CONFIG_STACKCHAN_PROCEDURAL_FACE=y",
+                "CONFIG_STACKCHAN_SKIP_CLOUD_CHECK=y",
+                "CONFIG_LANGUAGE_EN_US=y",
+                "CONFIG_USE_CUSTOM_WAKE_WORD=y",
+                "CONFIG_SR_MN_EN_MULTINET7_QUANT=y",
+                "CONFIG_CUSTOM_WAKE_WORD=\"hey robot\"",
+                "CONFIG_CUSTOM_WAKE_WORD_DISPLAY=\"hey robot\"",
+                "CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20",
+                "CONFIG_CUSTOM_WAKE_WORD_PHONEMES=\"hd RbBnT\"",
+                "CONFIG_CUSTOM_WAKE_WORD_DROP_G2P=y",
+                "CONFIG_LISTEN_AUTO_STOP_MAX_MS=15000",
+                "CONFIG_LISTEN_AUTO_STOP_SILENCE_MS=2000",
+                "CONFIG_STACKCHAN_REST_PITCH_DEG=85",
+                "CONFIG_STACKCHAN_AUTO_TORQUE_RELEASE_ENABLED=n",
+                "CONFIG_STACKCHAN_CLOCK_SCREENSAVER_SECONDS=180",
+                "CONFIG_STACKCHAN_TIMEZONE=\"WET0WEST,M3.5.0/1,M10.5.0\"",
+                "CONFIG_STACKCHAN_PITCH_LIMITS=y",
+                "CONFIG_STACKCHAN_PITCH_MIN=50",
+                "CONFIG_STACKCHAN_PITCH_MAX=90",
+                "CONFIG_STACKCHAN_LCD_PCLK_MHZ=40",
+                "CONFIG_STACKCHAN_LCD_WEAK_DRIVE=n"
+            ]
         }
     ]
 }

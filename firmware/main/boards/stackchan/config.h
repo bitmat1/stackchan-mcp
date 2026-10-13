@@ -4,6 +4,7 @@
 // M5Stack CoreS3 Board configuration
 
 #include <driver/gpio.h>
+#include <sdkconfig.h>
 
 #define AUDIO_INPUT_REFERENCE    true
 #define AUDIO_INPUT_SAMPLE_RATE  24000
@@ -74,11 +75,17 @@
 
 #define XCLK_FREQ_HZ 20000000
 
-// Servo (SCS0009) pin configuration
+// Servo pin configuration. The official kit (SCS0009) and Stack-chan RT
+// ver. (DYNAMIXEL XL330) both use GPIO6/7 at 1 Mbps, with TX and RX swapped.
 #define SERVO_UART_NUM UART_NUM_1
 #define SERVO_BAUDRATE 1000000
+#if CONFIG_STACKCHAN_SERVO_DYNAMIXEL
+#define SERVO_TX_PIN 7
+#define SERVO_RX_PIN 6
+#else
 #define SERVO_TX_PIN 6
 #define SERVO_RX_PIN 7
+#endif
 #define SERVO_YAW_ID 1
 #define SERVO_PITCH_ID 2
 

@@ -825,6 +825,10 @@ else()
 endif()
 
 if(CONFIG_BOARD_TYPE_STACKCHAN)
+    # The emote library registers itself WHOLE_ARCHIVE, which drags ~120 KB
+    # of fonts and assets into every build. StackChan never creates an
+    # EmoteDisplay, so link it normally and let --gc-sections drop it.
+    idf_component_set_property(espressif2022__esp_emote_expression WHOLE_ARCHIVE FALSE)
     set(STACKCHAN_BOARD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/boards/stackchan)
     set(STACKCHAN_LOCAL_AVATAR_CC ${STACKCHAN_BOARD_DIR}/avatar_images.local.cc)
     set(STACKCHAN_LOCAL_AVATAR_H ${STACKCHAN_BOARD_DIR}/avatar_images.local.h)
@@ -862,6 +866,33 @@ if(CONFIG_BOARD_TYPE_STACKCHAN)
         list(APPEND INCLUDE_DIRS
             "${CMAKE_CURRENT_SOURCE_DIR}/../components/feetech_scs")
         message(STATUS "StackChan: using MIT FeetechScs driver, excluding SCServo_lib sources from build")
+    endif()
+    # show_gif decodes every frame with gifdec: speed over the project's -Os.
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/display/lvgl_display/gif/gifdec.c"
+        PROPERTIES COMPILE_OPTIONS "-O2")
+    if(CONFIG_STACKCHAN_PROCEDURAL_FACE)
+        list(APPEND BOARD_SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/../components/procedural_face/procedural_face.cc")
+        # Hot pixel loop: optimise for speed, not the project-wide -Os.
+        set_source_files_properties(
+            "${CMAKE_CURRENT_SOURCE_DIR}/../components/procedural_face/procedural_face.cc"
+            PROPERTIES COMPILE_OPTIONS "-O2;-ffast-math")
+        list(APPEND INCLUDE_DIRS
+            "${CMAKE_CURRENT_SOURCE_DIR}/../components/procedural_face")
+    endif()
+    # Stack-chan RT ver.: same inlining approach as the FeetechScs driver
+    # above, for the DYNAMIXEL Protocol 2.0 driver.
+    if(CONFIG_STACKCHAN_SERVO_DYNAMIXEL)
+        list(REMOVE_ITEM BOARD_SOURCES
+            ${STACKCHAN_BOARD_DIR}/SCS.cc
+            ${STACKCHAN_BOARD_DIR}/SCSCL.cc
+            ${STACKCHAN_BOARD_DIR}/SCSerial.cc)
+        list(APPEND BOARD_SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/../components/dynamixel_bus/dynamixel_bus.cpp")
+        list(APPEND INCLUDE_DIRS
+            "${CMAKE_CURRENT_SOURCE_DIR}/../components/dynamixel_bus")
+        message(STATUS "StackChan: using DYNAMIXEL driver (RT ver.), excluding SCServo_lib sources from build")
     endif()
 endif()
 list(APPEND SOURCES ${BOARD_SOURCES})

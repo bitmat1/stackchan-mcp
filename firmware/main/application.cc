@@ -64,6 +64,24 @@ Application::Application() {
         .skip_unhandled_events = true
     };
     esp_timer_create(&clock_timer_args, &clock_timer_handle_);
+
+#if CONFIG_LISTEN_AUTO_STOP_MAX_MS > 0 || CONFIG_LISTEN_AUTO_STOP_SILENCE_MS > 0
+    esp_timer_create_args_t endpoint_timer_args = {
+        .callback = [](void* arg) {
+            Application* app = (Application*)arg;
+            if (app->endpoint_armed_) {
+                app->Schedule([app]() { app->CheckListeningEndpoint(); });
+            }
+        },
+        .arg = this,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "listen_endpoint",
+        .skip_unhandled_events = true
+    };
+    if (esp_timer_create(&endpoint_timer_args, &endpoint_timer_handle_) == ESP_OK) {
+        esp_timer_start_periodic(endpoint_timer_handle_, 200 * 1000);
+    }
+#endif
 }
 
 Application::~Application() {
@@ -251,6 +269,14 @@ void Application::Run() {
         }
 
         if (bits & MAIN_EVENT_VAD_CHANGE) {
+            if (endpoint_armed_ && GetDeviceState() == kDeviceStateListening) {
+                // Both edges mark the latest voice activity: speech start
+                // counts as heard, speech end starts the silence window.
+                if (audio_service_.IsVoiceDetected()) {
+                    endpoint_heard_voice_ = true;
+                }
+                endpoint_last_voice_us_ = esp_timer_get_time();
+            }
             if (GetDeviceState() == kDeviceStateListening) {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
@@ -348,8 +374,16 @@ void Application::ActivationTask() {
     // Check for new assets version
     CheckAssetsVersion();
 
+#if CONFIG_STACKCHAN_SKIP_CLOUD_CHECK
+    // Local-gateway builds never talk to the xiaozhi cloud: skip the OTA
+    // version check and its device activation loop (which otherwise blocks
+    // on an activation code for xiaozhi.me) and go straight to the
+    // WebSocket protocol, which finds the gateway via NVS / mDNS / Kconfig.
+    ESP_LOGI(TAG, "Cloud OTA / activation check skipped (CONFIG_STACKCHAN_SKIP_CLOUD_CHECK)");
+#else
     // Check for new firmware version
     CheckNewVersion();
+#endif
 
     // Initialize the protocol
     InitializeProtocol();
@@ -622,6 +656,8 @@ void Application::InitializeProtocol() {
             } else if (strcmp(state->valuestring, "start") == 0) {
                 auto profile = ParseListenProfile(root);
                 Schedule([this, profile]() {
+                    // The gateway owns this capture window; no auto-stop.
+                    server_driven_listen_ = true;
                     StartListening(profile);
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
@@ -933,6 +969,36 @@ void Application::HandleStopListeningEvent() {
     }
 }
 
+// Ends a wake-word / tap listening turn after CONFIG_LISTEN_AUTO_STOP_SILENCE_MS
+// of silence once speech has been heard, or after CONFIG_LISTEN_AUTO_STOP_MAX_MS
+// in total, whichever comes first. Runs on the main task.
+void Application::CheckListeningEndpoint() {
+    if (!endpoint_armed_) return;
+    if (GetDeviceState() != kDeviceStateListening) {
+        endpoint_armed_ = false;
+        return;
+    }
+    const int64_t now = esp_timer_get_time();
+    const char* reason = nullptr;
+#if CONFIG_LISTEN_AUTO_STOP_MAX_MS > 0
+    if (now - endpoint_started_us_ >= int64_t(CONFIG_LISTEN_AUTO_STOP_MAX_MS) * 1000) {
+        reason = "max duration";
+    }
+#endif
+#if CONFIG_LISTEN_AUTO_STOP_SILENCE_MS > 0
+    if (reason == nullptr && endpoint_heard_voice_ && !audio_service_.IsVoiceDetected() &&
+        now - endpoint_last_voice_us_ >= int64_t(CONFIG_LISTEN_AUTO_STOP_SILENCE_MS) * 1000) {
+        reason = "silence";
+    }
+#endif
+    if (reason != nullptr) {
+        ESP_LOGI(TAG, "Auto-stopping listening (%s, %d ms)", reason,
+                 (int)((now - endpoint_started_us_) / 1000));
+        endpoint_armed_ = false;
+        StopListening();
+    }
+}
+
 void Application::HandleWakeWordDetectedEvent() {
     if (!protocol_) {
         return;
@@ -987,8 +1053,14 @@ void Application::HandleWakeWordDetectedEvent() {
 }
 
 void Application::ContinueWakeWordInvoke(const std::string& wake_word, uint32_t generation) {
-    // Check state again in case it was changed during scheduling
-    if (GetDeviceState() != kDeviceStateConnecting || !IsListeningRequestCurrent(generation)) {
+    // Check state again in case it was changed during scheduling. When the
+    // audio channel was already open (e.g. left open by the last TTS reply),
+    // HandleWakeWordDetectedEvent calls this directly without moving to
+    // Connecting first, so Idle is also a valid starting state here;
+    // rejecting it made every wake word after the first one a no-op.
+    auto state = GetDeviceState();
+    if ((state != kDeviceStateConnecting && state != kDeviceStateIdle) ||
+        !IsListeningRequestCurrent(generation)) {
         listening_profile_ = ListeningProfileAfterStop(listening_profile_);
         return;
     }
@@ -1052,6 +1124,11 @@ void Application::HandleStateChangedEvent() {
             display->SetChatMessage("system", "");
             break;
         case kDeviceStateListening: {
+            endpoint_armed_ = !server_driven_listen_;
+            server_driven_listen_ = false;
+            endpoint_heard_voice_ = false;
+            endpoint_started_us_ = esp_timer_get_time();
+            endpoint_last_voice_us_ = endpoint_started_us_;
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 

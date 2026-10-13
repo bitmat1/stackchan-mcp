@@ -66,6 +66,8 @@ public:
     void Run();
 
     DeviceState GetDeviceState() const { return state_machine_.GetState(); }
+    // True while the WebSocket to the gateway is up (persistent transport).
+    bool IsGatewayConnected() const { return protocol_ && protocol_->IsTransportConnected(); }
     bool IsVoiceDetected() const { return audio_service_.IsVoiceDetected(); }
     std::string GetConnectedGatewayUrl() const {
         return protocol_ ? protocol_->GetConnectedUrl() : "";
@@ -141,6 +143,14 @@ private:
     std::unique_ptr<Protocol> protocol_;
     EventGroupHandle_t event_group_ = nullptr;
     esp_timer_handle_t clock_timer_handle_ = nullptr;
+    // Auto-stop for device-initiated listening (wake word / tap); see
+    // CheckListeningEndpoint(). Gateway-driven listen() keeps its own window.
+    esp_timer_handle_t endpoint_timer_handle_ = nullptr;
+    bool server_driven_listen_ = false;
+    bool endpoint_armed_ = false;
+    bool endpoint_heard_voice_ = false;
+    int64_t endpoint_started_us_ = 0;
+    int64_t endpoint_last_voice_us_ = 0;
     DeviceStateMachine state_machine_;
     ListeningMode listening_mode_ = kListeningModeAutoStop;
     std::atomic<ListeningProfile> pending_listening_profile_{kListeningProfileVoice};
@@ -162,6 +172,7 @@ private:
 
     // Event handlers
     void HandleStateChangedEvent();
+    void CheckListeningEndpoint();
     void HandleToggleChatEvent();
     void HandleStartListeningEvent();
     void HandleStopListeningEvent();

@@ -17,7 +17,14 @@
 // used by this board, but their WritePos success value differs (see
 // ServoWritePosOk() below). The rest of stackchan.cc treats both drivers
 // uniformly through the ScsBus type alias plus that helper.
-#if CONFIG_STACKCHAN_SERVO_FEETECH
+#if CONFIG_STACKCHAN_SERVO_DYNAMIXEL
+// Stack-chan RT ver.: DYNAMIXEL XL330 driver with the same call shapes as
+// FeetechScs, translating SCS0009 raw units per axis.
+#include "dynamixel_bus.h"
+using ScsBus = DynamixelBus;
+// DynamixelBus::WritePos returns 0 on status ACK and -1 on bus error.
+static inline bool ServoWritePosOk(int r) { return r >= 0; }
+#elif CONFIG_STACKCHAN_SERVO_FEETECH
 #include "feetech_scs.h"
 using ScsBus = FeetechScs;
 // FeetechScs::WritePos returns 0 on ACK and -1 on bus error.
@@ -32,6 +39,21 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include "avatar_images.h"
 #include "avatar_set.h"
 #include "avatar_set_fetcher.h"
+#include "display/lvgl_display/lvgl_theme.h"
+#include <font_awesome.h>
+#include <esp_netif_sntp.h>
+#include <ctime>
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+// Procedurally drawn face with ~27 expressions (components/procedural_face).
+// Replaces the built-in six-image avatar whenever no custom AvatarSet is
+// loaded; load_avatar_set still takes precedence.
+#include "procedural_face.h"
+#endif
+#include "lvgl_display/gif/gifdec.h"
+#if CONFIG_STACKCHAN_BODY_SENSORS
+#include "body_events.h"
+#include "body_sensors.h"
+#endif
 
 #include <smooth_ui_toolkit.hpp>
 #include <esp_log.h>
@@ -44,10 +66,12 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include <esp_lcd_panel_commands.h>
 #include <esp_lcd_ili9341.h>
 #include <esp_timer.h>
+#include <esp_heap_caps.h>
 #include <esp_random.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <freertos/idf_additions.h>
 #include "esp_video.h"
 #include <cJSON.h>
 #include <lvgl.h>
@@ -61,6 +85,16 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include <vector>
 
 #define TAG "StackChanBoard"
+
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+#define STACKCHAN_FACE_NAMES                                                       \
+    "idle, happy, thinking, sad, surprised, embarrassed, laughing, excited, "      \
+    "love, wink, smug, cool, crying, angry, annoyed, shocked, confused, "          \
+    "doubtful, sleepy, bored, nervous, scared, curious, dizzy, relieved, "         \
+    "listening, kiss"
+#else
+#define STACKCHAN_FACE_NAMES "idle, happy, thinking, sad, surprised, embarrassed"
+#endif
 
 #ifndef STACKCHAN_SCREEN_OFF_DEFAULT_TIMEOUT_SECONDS
 #define STACKCHAN_SCREEN_OFF_DEFAULT_TIMEOUT_SECONDS 300
@@ -666,6 +700,7 @@ private:
     std::atomic<int> screen_off_timeout_seconds_{
         STACKCHAN_SCREEN_OFF_DEFAULT_TIMEOUT_SECONDS};
     std::atomic<bool> screen_is_off_{false};
+    std::atomic<bool> dimmed_{false};  // power-save sleep (backlight at 10)
     int64_t screen_off_deadline_us_ = 0;  // guarded by screen_power_mutex_
     int64_t panel_sleep_started_us_ = 0;  // guarded by screen_power_mutex_
     uint8_t screen_saved_brightness_ = 75;  // guarded by screen_power_mutex_
@@ -725,9 +760,128 @@ private:
         MOUTH = 2,
     };
     int current_face_index_ = 0;   // 0..5  (idle / happy / thinking / sad / surprised / embarrassed)
+                                   // 0..26 with CONFIG_STACKCHAN_PROCEDURAL_FACE
     int current_eyes_index_ = 0;   // 0..2  (open / half / closed) — 0 is the resting state
     int current_mouth_index_ = 0;  // 0..4  (closed / half / open / e / u) — 0 is the resting state
     ActiveLayer active_layer_ = ActiveLayer::FACE;
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+    // Two full-screen RGB565 frames in PSRAM, alternated on every render so
+    // LVGL always sees a new image source and redraws.
+    // Drawn at full panel resolution and shown unscaled. A half-size image
+    // shown at 2x made LVGL software-transform every frame, which kept
+    // core 1 saturated and corrupted the panel stream once faces animated.
+    static constexpr int kProcFaceW = 320;
+    static constexpr int kProcFaceH = 240;
+    uint16_t* proc_face_buf_[2] = {nullptr, nullptr};
+    lv_image_dsc_t proc_face_dsc_[2]{};
+    int proc_face_front_ = 0;
+    // Animation frames are drawn by a low-priority task into this scratch
+    // buffer without holding the display lock; only the swap is locked.
+    uint16_t* proc_face_scratch_ = nullptr;
+    std::atomic<uint32_t> proc_face_generation_{0};
+    TaskHandle_t proc_face_anim_task_ = nullptr;
+    // Animation period (0 = only redraw on changes), adjustable at runtime
+    // via self.display.set_animation for diagnosing display glitches.
+    std::atomic<int> proc_face_anim_ms_{200};
+    // Frame timing stats since the last self.display.get_face_stats call.
+    std::atomic<uint32_t> face_stat_frames_{0};
+    std::atomic<uint32_t> face_stat_render_us_sum_{0};
+    std::atomic<uint32_t> face_stat_render_us_max_{0};
+    std::atomic<uint32_t> face_stat_lock_us_max_{0};
+    std::atomic<uint32_t> face_stat_lock_us_sum_{0};
+    // Eye direction set via self.display.set_gaze, in design pixels.
+    float gaze_x_ = 0.0f;
+    float gaze_y_ = 0.0f;
+#endif
+
+    // Screen overlays drawn above the face on lv_layer_top():
+    // self.display.show_image (a 320x240 RGB565 picture fetched from the
+    // gateway) and self.display.show_text (a caption). Each hides after its
+    // timeout, and a short tap on the screen dismisses them instead of
+    // starting to listen.
+    static constexpr int kOverlayImageW = 320;
+    static constexpr int kOverlayImageH = 240;
+    static constexpr size_t kOverlayImageBytes =
+        static_cast<size_t>(kOverlayImageW) * kOverlayImageH * 2;
+    uint8_t* overlay_image_buf_ = nullptr;
+    lv_image_dsc_t overlay_image_dsc_{};
+    lv_obj_t* overlay_image_ = nullptr;
+    lv_obj_t* overlay_text_ = nullptr;
+    esp_timer_handle_t overlay_image_timer_ = nullptr;
+    esp_timer_handle_t overlay_text_timer_ = nullptr;
+    std::atomic<bool> overlay_image_loading_{false};
+    std::string overlay_image_last_error_;
+
+    // ---- GIF player (self.display.show_gif) ----
+    // One persistent task downloads the GIF into PSRAM and plays it through a
+    // PSRAM RGB565 frame. Each frame only the rectangle that changed is
+    // converted and redrawn, and it is rendered at once with lv_refr_now
+    // under the display lock, so every frame reaches the panel and LVGL never
+    // reads the frame mid-update (no second buffer needed). While it plays
+    // the face is hidden and its task paused, so nothing redraws in between.
+    static constexpr size_t kGifMaxBytes = 3 * 1024 * 1024;
+    struct GifJob {
+        std::string url, token;
+        int seconds = 0;  // 0 = no time limit
+        int loops = 0;    // 0 = repeat until seconds / tap / clear
+        bool fast = false;  // ignore the GIF's frame delays
+    };
+    TaskHandle_t gif_task_ = nullptr;
+    SemaphoreHandle_t gif_mutex_ = nullptr;  // guards gif_pending_
+    std::unique_ptr<GifJob> gif_pending_;
+    std::atomic<bool> gif_stop_{false};
+    std::atomic<bool> gif_playing_{false};
+    std::atomic<int> gif_fps_x10_{0};
+    std::string gif_last_error_;
+    std::string gif_last_stats_;  // per-stage timing of the last GIF
+    uint16_t* gif_buf_ = nullptr;
+    lv_image_dsc_t gif_dsc_ = {};
+    lv_obj_t* gif_img_ = nullptr;
+    bool gif_hid_avatar_ = false;  // restore only what the GIF hid
+
+    // Wi-Fi (top left) and battery (top right) indicators drawn above the
+    // face, which otherwise covers xiaozhi's own status bar.
+    lv_obj_t* status_wifi_label_ = nullptr;
+    lv_obj_t* status_battery_label_ = nullptr;
+    lv_obj_t* status_battery_pct_label_ = nullptr;
+    esp_timer_handle_t status_icons_timer_ = nullptr;
+    esp_timer_handle_t lcd_refresh_timer_ = nullptr;
+    // Off by default while diagnosing: the re-send itself talks to the panel.
+    std::atomic<bool> lcd_refresh_enabled_{false};
+    // Whether the gateway reports a Claude client (Claude Code / Desktop)
+    // connected; pushed by the gateway via self.display.set_link_status.
+    std::atomic<bool> claude_connected_{false};
+
+    // Clock screensaver: after CONFIG_STACKCHAN_CLOCK_SCREENSAVER_SECONDS
+    // without activity (speech, touch, face/tool changes) the face is
+    // covered by a large clock set from SNTP. Any activity removes it.
+    uint16_t* clock_buf_ = nullptr;
+    lv_image_dsc_t clock_dsc_{};
+    lv_obj_t* clock_img_ = nullptr;
+    lv_obj_t* clock_date_ = nullptr;
+    esp_timer_handle_t clock_tick_timer_ = nullptr;
+    std::atomic<int64_t> last_activity_us_{0};
+    bool clock_visible_ = false;
+    int64_t clock_shown_us_ = 0;
+    int64_t clock_hidden_us_ = 0;
+    int clock_drawn_minute_ = -1;
+    bool sntp_started_ = false;
+
+    // Bottom text strip shared by the ticker (self.display.set_ticker) and
+    // speech subtitles (self.display.set_subtitle, sent by the gateway's
+    // say()). A subtitle temporarily replaces the ticker.
+    lv_obj_t* strip_bar_ = nullptr;
+    lv_obj_t* strip_label_ = nullptr;
+    std::string ticker_text_;
+    int ticker_speed_px_s_ = 60;
+    esp_timer_handle_t ticker_timer_ = nullptr;
+    std::string subtitle_text_;
+    int subtitle_duration_ms_ = 0;
+    int64_t subtitle_scroll_end_us_ = 0;  // when the one-pass scroll finishes
+    esp_timer_handle_t subtitle_clear_timer_ = nullptr;
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+    procedural_face::Style face_style_ = procedural_face::Style::kStackchan;
+#endif
 
     // Pending state captured while an avatar_set_fetch is in flight.
     // Calls to set_avatar / set_mouth_shape / set_blink during a fetch
@@ -835,6 +989,23 @@ private:
     bool si12t_ok_ = false;
     esp_timer_handle_t touch_poll_timer_ = nullptr;
     esp_timer_handle_t touch_revert_timer_ = nullptr;
+
+#if CONFIG_STACKCHAN_BODY_SENSORS
+    // On-board IMU and proximity sensor (body_sensors.h). Polled from the
+    // body_poll esp_timer; the latest readings are kept for the get_* tools.
+    static constexpr int BODY_POLL_MS = 40;
+    static constexpr int PROXIMITY_EVERY = 5;  // proximity every 200 ms
+    std::unique_ptr<body_sensors::Bmi270> imu_;
+    std::unique_ptr<body_sensors::Ltr553> prox_;
+    body_events::MotionDetector motion_detector_;
+    body_events::ProximityDetector proximity_detector_;
+    esp_timer_handle_t body_poll_timer_ = nullptr;
+    int body_poll_count_ = 0;
+    portMUX_TYPE body_mux_ = portMUX_INITIALIZER_UNLOCKED;
+    float body_accel_[3] = {};
+    float body_gyro_[3] = {};
+    int body_proximity_ = -1;
+#endif
 
     // Touch detection state (single-thread access from the touch_poll_timer_
     // callback, which runs on the ESP_TIMER_TASK).
@@ -1026,6 +1197,11 @@ private:
     //      into motion interpolation.
     //   3. The set_head_angles MCP handler additionally clamps the
     //      request target so the original out-of-range value is logged.
+#ifdef CONFIG_STACKCHAN_PITCH_MIN
+    // Board-specific mechanical range (Stack-chan RT ver.: 50..90).
+    static constexpr int SAFE_PITCH_MIN = CONFIG_STACKCHAN_PITCH_MIN;
+    static constexpr int SAFE_PITCH_MAX = CONFIG_STACKCHAN_PITCH_MAX;
+#else
     static constexpr int SAFE_PITCH_MIN = 0;
     static constexpr int SAFE_PITCH_MAX = 88;  // Issue #98: validated on real hardware
                                                 // (M5Stack CoreS3 + SCS0009 ×2). On-device
@@ -1035,8 +1211,14 @@ private:
                                                 // ("ji-ji-" gear strain sound). Mirrors PR #81
                                                 // lower-bound rationale: stay 1° inside the
                                                 // observed servo-strain boundary.
+#endif
+#ifdef CONFIG_STACKCHAN_PITCH_MIN
+    static constexpr int RECOMMENDED_PITCH_MIN = SAFE_PITCH_MIN;
+    static constexpr int RECOMMENDED_PITCH_MAX = SAFE_PITCH_MAX;
+#else
     static constexpr int RECOMMENDED_PITCH_MIN = 5;   // M5Stack official docs
     static constexpr int RECOMMENDED_PITCH_MAX = 85;  // M5Stack official docs
+#endif
 
     // Issue #115: boot-time initialization target. Fall-safe neutral pose
     // well clear of both mechanical end-stops, in the centre of the
@@ -1077,7 +1259,11 @@ private:
     // target, risking servo bus degradation if the SCS0009 wakes up
     // mid-sequence.
     static constexpr int BOOT_INIT_YAW_DEG = 0;
+#ifdef CONFIG_STACKCHAN_REST_PITCH_DEG
+    static constexpr int BOOT_INIT_PITCH_DEG = CONFIG_STACKCHAN_REST_PITCH_DEG;
+#else
     static constexpr int BOOT_INIT_PITCH_DEG = 45;
+#endif
     // BOOT_INIT_MOVE_MS=3000: minimum duration of the Phase 0 climb.
     // Used as a floor so the boot-init `WriteHeadAngles(0, 45, X)`
     // always elapses at least this long — required on the PMIC OFF/ON
@@ -2265,12 +2451,15 @@ private:
     };
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        // Dim after 1 min idle, power off after 10 min.
+        power_save_timer_ = new PowerSaveTimer(-1, 60, 600);
         power_save_timer_->OnEnterSleepMode([this]() {
+            dimmed_.store(true);
             GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(10);
         });
         power_save_timer_->OnExitSleepMode([this]() {
+            dimmed_.store(false);
             GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
         });
@@ -2523,6 +2712,7 @@ private:
     }
 
     void HandleScreenActivity() {
+        NoteActivity();
         if (screen_power_mutex_ == nullptr ||
             xSemaphoreTake(screen_power_mutex_, portMAX_DELAY) != pdTRUE) {
             return;
@@ -3055,6 +3245,11 @@ private:
 
             // 只有短触才触发
             if (touch_duration < TOUCH_THRESHOLD_MS) {
+                // A tap on a picture or caption dismisses it rather than
+                // starting to listen.
+                if (DismissOverlaysOnTap()) {
+                    return;
+                }
                 if (app.GetDeviceState() == kDeviceStateStarting) {
                     EnterWifiConfigMode();
                     return;
@@ -3127,6 +3322,19 @@ private:
     }
 
     void InitializeSpi() {
+        // The microSD slot shares this bus, and its data-out line is the
+        // LCD's D/C pin (GPIO35). With the card's CS (GPIO4) left floating,
+        // a card can answer pixel data that happens to look like SD commands
+        // and flip D/C, so the panel takes pixels as commands (inverted,
+        // asleep, black until reboot). Colourful frames trigger it, black and
+        // white ones never do. Hold the card deselected, as M5Unified does.
+        gpio_config_t sd_cs = {};
+        sd_cs.pin_bit_mask = 1ULL << GPIO_NUM_4;
+        sd_cs.mode = GPIO_MODE_OUTPUT;
+        sd_cs.pull_up_en = GPIO_PULLUP_ENABLE;
+        gpio_config(&sd_cs);
+        gpio_set_level(GPIO_NUM_4, 1);
+
         spi_bus_config_t buscfg = {};
         buscfg.mosi_io_num = GPIO_NUM_37;
         buscfg.miso_io_num = GPIO_NUM_NC;
@@ -3148,11 +3356,25 @@ private:
         io_config.cs_gpio_num = GPIO_NUM_3;
         io_config.dc_gpio_num = GPIO_NUM_35;
         io_config.spi_mode = 2;
+#ifdef CONFIG_STACKCHAN_LCD_PCLK_MHZ
+        io_config.pclk_hz = CONFIG_STACKCHAN_LCD_PCLK_MHZ * 1000 * 1000;
+#else
         io_config.pclk_hz = 40 * 1000 * 1000;
+#endif
         io_config.trans_queue_depth = 10;
         io_config.lcd_cmd_bits = 8;
         io_config.lcd_param_bits = 8;
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI3_HOST, &io_config, &panel_io));
+#if CONFIG_STACKCHAN_LCD_WEAK_DRIVE
+        // The LCD D/C line (GPIO35) runs beside MOSI (37) and SCLK (36).
+        // With busy, bright frames the fast edges couple into D/C and the
+        // panel latches pixel bytes as commands (dark / flashing screen).
+        // The weakest drive strength softens the edges; it is ample for
+        // the short on-board traces at the reduced clock.
+        for (gpio_num_t pin : {GPIO_NUM_37, GPIO_NUM_36, GPIO_NUM_35, GPIO_NUM_3}) {
+            gpio_set_drive_capability(pin, GPIO_DRIVE_CAP_0);
+        }
+#endif
 
         ESP_LOGD(TAG, "Install LCD driver");
         esp_lcd_panel_dev_config_t panel_config = {};
@@ -3372,10 +3594,79 @@ private:
         }
     }
 
+#if CONFIG_STACKCHAN_SERVO_DYNAMIXEL
+    // Stack-chan RT ver. geometry. The board code speaks the official kit's
+    // angle convention: yaw -90..90, pitch 0 (down end-stop) .. 88 (up)
+    // with 45 as the rest pose. The RT head sits level at XL330 centre
+    // (2048), tilts up toward lower raw values and has a narrower range
+    // (rt-net's firmware clamps tilt to -30..+10 deg), so pitch is mapped
+    // piecewise: 45 -> level, 88 -> full tilt-up, 0 -> full tilt-down.
+    // Kit pitch that maps to a level RT head. Fixed at 45 (the kit's
+    // standard rest pose) so changing the rest pose does not move "level".
+    static constexpr float kKitPitchRest = 45;
+    static constexpr float kKitPitchMax = SAFE_PITCH_MAX;
+
+    static float RtYawToDxl(float deg) {
+#if CONFIG_STACKCHAN_DXL_YAW_INVERT
+        return -deg;
+#else
+        return deg;
+#endif
+    }
+
+    static float RtPitchToDxl(float deg) {
+        const float up = CONFIG_STACKCHAN_DXL_PITCH_UP_DEG;
+        const float down = CONFIG_STACKCHAN_DXL_PITCH_DOWN_DEG;
+        float tilt = deg >= kKitPitchRest
+            ? -(deg - kKitPitchRest) * up / (kKitPitchMax - kKitPitchRest)
+            : (kKitPitchRest - deg) * down / kKitPitchRest;
+#if CONFIG_STACKCHAN_DXL_PITCH_INVERT
+        tilt = -tilt;
+#endif
+        return tilt;
+    }
+
+    static float DxlPitchToRt(float tilt) {
+        const float up = CONFIG_STACKCHAN_DXL_PITCH_UP_DEG;
+        const float down = CONFIG_STACKCHAN_DXL_PITCH_DOWN_DEG;
+#if CONFIG_STACKCHAN_DXL_PITCH_INVERT
+        tilt = -tilt;
+#endif
+        if (tilt <= 0) {
+            return kKitPitchRest - tilt * (kKitPitchMax - kKitPitchRest) / up;
+        }
+        return down > 0 ? kKitPitchRest - tilt * kKitPitchRest / down : kKitPitchRest;
+    }
+
+    void ConfigureDynamixelAxes() {
+        DynamixelBus::Axis yaw;
+        yaw.id = SERVO_YAW_ID;
+        yaw.scs_zero = 460;  // YawDegToPos(0)
+        yaw.scs_deg_to_dxl_deg = RtYawToDxl;
+        yaw.dxl_deg_to_scs_deg = RtYawToDxl;  // negation is its own inverse
+        yaw.goal_current_ma = CONFIG_STACKCHAN_DXL_YAW_GOAL_CURRENT_MA;
+        scs_bus_.ConfigureAxis(yaw);
+
+        DynamixelBus::Axis pitch;
+        pitch.id = SERVO_PITCH_ID;
+        pitch.scs_zero = 620;  // PitchDegToPos(0)
+        pitch.scs_deg_to_dxl_deg = RtPitchToDxl;
+        pitch.dxl_deg_to_scs_deg = DxlPitchToRt;
+        pitch.goal_current_ma = CONFIG_STACKCHAN_DXL_PITCH_GOAL_CURRENT_MA;
+        scs_bus_.ConfigureAxis(pitch);
+    }
+#endif
+
     void InitializeServo() {
         ESP_LOGI(TAG, "Init SCS0009 servo bus (UART%d, baud=%d, tx=%d, rx=%d)",
                  SERVO_UART_NUM, SERVO_BAUDRATE, SERVO_TX_PIN, SERVO_RX_PIN);
-#if CONFIG_STACKCHAN_SERVO_FEETECH
+#if CONFIG_STACKCHAN_SERVO_DYNAMIXEL
+        ConfigureDynamixelAxes();
+        // DynamixelBus::begin() returns void and aborts on UART errors,
+        // like FeetechScs::begin() below.
+        scs_bus_.begin(SERVO_UART_NUM, SERVO_BAUDRATE, SERVO_TX_PIN, SERVO_RX_PIN);
+        servo_ok_ = true;
+#elif CONFIG_STACKCHAN_SERVO_FEETECH
         // FeetechScs::begin() returns void and uses ESP_ERROR_CHECK internally,
         // so a UART configuration error aborts the boot rather than reporting
         // false. If begin() returns to us, init succeeded.
@@ -3939,7 +4230,7 @@ private:
         const bool disables_axis = !yaw_enabled || !pitch_enabled;
 
         auto update_bus_ok = [&]() {
-#if CONFIG_STACKCHAN_SERVO_FEETECH
+#if CONFIG_STACKCHAN_SERVO_FEETECH || CONFIG_STACKCHAN_SERVO_DYNAMIXEL
             result.yaw_ok = (result.yaw_bus_return == 0);
             result.pitch_ok = (result.pitch_bus_return == 0);
 #else
@@ -4771,9 +5062,91 @@ private:
         ESP_LOGI(TAG, "Si12T touch poll started (%d ms interval)", TOUCH_POLL_MS);
     }
 
+#if CONFIG_STACKCHAN_BODY_SENSORS
+    void InitializeBodySensors() {
+        imu_ = std::make_unique<body_sensors::Bmi270>(i2c_bus_);
+        if (!imu_->Begin()) imu_.reset();
+        prox_ = std::make_unique<body_sensors::Ltr553>(i2c_bus_);
+        if (!prox_->Begin()) prox_.reset();
+        if (!imu_ && !prox_) return;
+        esp_timer_create_args_t args = {
+            .callback = [](void* arg) { static_cast<StackChanBoard*>(arg)->BodyPollTick(); },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "body_poll",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&args, &body_poll_timer_) == ESP_OK) {
+            esp_timer_start_periodic(body_poll_timer_, BODY_POLL_MS * 1000);
+        }
+    }
+
+    // A local reaction (like a head touch) plus a stackchan-event so the
+    // gateway can tell Claude. An event that finds the robot in its
+    // screensaver (clock, dimmed or screen off) wakes it looking surprised.
+    // Runs in the esp_timer task, like ClockTick, so clock_visible_ is safe.
+    void BodyReact(const char* event_type, const char* subtype, uint32_t duration_ms,
+                   const char* face, bool wakes = true) {
+        ESP_LOGI(TAG, "body event: %s/%s (%u ms)", event_type, subtype,
+                 static_cast<unsigned>(duration_ms));
+        if (wakes) {
+            const bool asleep = clock_visible_ || dimmed_.load() || screen_is_off_.load();
+            OnUserActivity();
+            NoteActivity();
+            if (asleep) {
+                HideClock();
+                face = "surprised";
+            }
+        }
+        if (face != nullptr && SetAvatarExpressionIfActive(face)) ScheduleIdleRevert();
+        Application::GetInstance().SendStackChanEvent(event_type, subtype, duration_ms);
+    }
+
+    void BodyPollTick() {
+        const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+        if (imu_) {
+            float a[3], g[3];
+            if (imu_->ReadMotion(a, g)) {
+                taskENTER_CRITICAL(&body_mux_);
+                std::copy(a, a + 3, body_accel_);
+                std::copy(g, g + 3, body_gyro_);
+                taskEXIT_CRITICAL(&body_mux_);
+                const bool head_moving = motion_driver_ != nullptr && motion_driver_->IsMoving();
+                uint32_t held_ms = 0;
+                using body_events::MotionEvent;
+                const MotionEvent e = motion_detector_.Update(a, g, head_moving, now_ms, &held_ms);
+                switch (e) {
+                    case MotionEvent::kPickedUp: BodyReact("imu", Name(e), 0, "surprised"); break;
+                    case MotionEvent::kPutDown: BodyReact("imu", Name(e), held_ms, "relieved"); break;
+                    case MotionEvent::kTippedOver: BodyReact("imu", Name(e), held_ms, "dizzy"); break;
+                    case MotionEvent::kShake: BodyReact("imu", Name(e), 0, "dizzy"); break;
+                    default: break;
+                }
+            }
+        }
+        if (prox_ && ++body_poll_count_ >= PROXIMITY_EVERY) {
+            body_poll_count_ = 0;
+            const int raw = prox_->ReadProximity();
+            taskENTER_CRITICAL(&body_mux_);
+            body_proximity_ = raw;
+            taskEXIT_CRITICAL(&body_mux_);
+            uint32_t near_ms = 0;
+            using body_events::ProximityEvent;
+            const ProximityEvent e = proximity_detector_.Update(raw, now_ms, &near_ms);
+            if (e == ProximityEvent::kNear) BodyReact("proximity", Name(e), 0, "curious");
+            if (e == ProximityEvent::kFar) BodyReact("proximity", Name(e), near_ms, nullptr, false);
+        }
+    }
+#endif
+
     // Map a face name to AvatarSet's 0-indexed slot, or -1 if unknown.
     static int FaceNameToIndex(const char* face) {
         if (face == nullptr) return -1;
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+        // Same indices as below for the first six names, plus the extended
+        // expressions and a few aliases.
+        return procedural_face::ExpressionFromName(face);
+#else
         if (strcmp(face, "idle") == 0)        return 0;
         if (strcmp(face, "happy") == 0)       return 1;
         if (strcmp(face, "thinking") == 0)    return 2;
@@ -4781,6 +5154,7 @@ private:
         if (strcmp(face, "surprised") == 0)   return 4;
         if (strcmp(face, "embarrassed") == 0) return 5;
         return -1;
+#endif
     }
 
     // Map a mouth shape name to AvatarSet's 0-indexed slot, or -1 if unknown.
@@ -4865,6 +5239,11 @@ private:
     // loaded in matrix mode but the index triple is out of range, or the
     // avatar lv_obj cannot be created yet because the screen tree isn't up).
     bool RenderAvatarLocked() {
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+        if (!avatar_set_.is_loaded()) {
+            return RenderProceduralFaceLocked();
+        }
+#endif
         const lv_image_dsc_t* dsc = nullptr;
         if (avatar_set_.is_loaded() &&
             avatar_set_.mode() == AvatarSet::Mode::kMatrix) {
@@ -4886,10 +5265,1093 @@ private:
         }
         if (dsc == nullptr) return false;
         if (!EnsureAvatarObject()) return false;
+        // 160x120 avatar images are shown at 2x.
+        lv_image_set_scale(avatar_img_, 512);
         lv_image_set_src(avatar_img_, dsc);
         lv_obj_move_foreground(avatar_img_);
         BringListeningIndicatorToFrontLocked();
         return true;
+    }
+
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+    bool EnsureProceduralFaceBuffers() {
+        if (proc_face_scratch_ != nullptr) return true;
+        const size_t bytes = static_cast<size_t>(kProcFaceW) * kProcFaceH * 2;
+        for (int i = 0; i < 2; i++) {
+            proc_face_buf_[i] = static_cast<uint16_t*>(
+                heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            if (proc_face_buf_[i] == nullptr) {
+                ESP_LOGE(TAG, "Procedural face: PSRAM alloc of %u bytes failed", (unsigned)bytes);
+                return false;
+            }
+            lv_image_dsc_t& d = proc_face_dsc_[i];
+            d.header.magic = LV_IMAGE_HEADER_MAGIC;
+            d.header.cf = LV_COLOR_FORMAT_RGB565;
+            d.header.w = kProcFaceW;
+            d.header.h = kProcFaceH;
+            d.header.stride = kProcFaceW * 2;
+            d.data_size = bytes;
+            d.data = reinterpret_cast<const uint8_t*>(proc_face_buf_[i]);
+        }
+        proc_face_scratch_ = static_cast<uint16_t*>(
+            heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        return proc_face_scratch_ != nullptr;
+    }
+
+    procedural_face::State CurrentFaceState() const {
+        procedural_face::State state;
+        state.expression = static_cast<procedural_face::Expression>(current_face_index_);
+        state.eyes = active_layer_ == ActiveLayer::EYES ? current_eyes_index_ : 0;
+        state.mouth = active_layer_ == ActiveLayer::MOUTH ? current_mouth_index_ : -1;
+        state.tick_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+        state.style = face_style_;
+        state.gaze_x = gaze_x_;
+        state.gaze_y = gaze_y_;
+        return state;
+    }
+
+    // Shows the back buffer. Caller holds the display lock.
+    void ShowProceduralBackLocked(int back) {
+        lv_image_set_scale(avatar_img_, 256);
+        lv_image_set_src(avatar_img_, &proc_face_dsc_[back]);
+        proc_face_front_ = back;
+        lv_obj_move_foreground(avatar_img_);
+        BringListeningIndicatorToFrontLocked();
+    }
+
+    // Requests a redraw of the current expression / blink / mouth state.
+    // Drawing never happens on the caller's stack: blink and touch timers
+    // run on the small esp_timer task and lip-sync on its own task, and the
+    // Bender style needs more stack than they have (overflowing it
+    // corrupted memory and killed the display). The face task below draws
+    // with its own large stack and is woken immediately.
+    // Caller must hold the display lock.
+    bool RenderProceduralFaceLocked() {
+        if (!EnsureProceduralFaceBuffers()) return false;
+        if (!EnsureAvatarObject()) return false;
+        proc_face_generation_.fetch_add(1);
+        if (proc_face_anim_task_ != nullptr) xTaskNotifyGive(proc_face_anim_task_);
+        return true;
+    }
+
+    // The only place faces are drawn. Woken by RenderProceduralFaceLocked
+    // for changes, and every 200 ms to animate expressions that move. The
+    // frame is drawn into a scratch buffer without the display lock, so
+    // LVGL, audio and networking never wait on it; only the copy-and-swap
+    // is locked, and a frame is redrawn if the state changed meanwhile.
+    static void ProceduralFaceAnimTask(void* arg) {
+        auto* board = static_cast<StackChanBoard*>(arg);
+        const size_t bytes = static_cast<size_t>(kProcFaceW) * kProcFaceH * 2;
+        uint32_t drawn_generation = 0;
+        int last_render_ms = 0;
+        while (true) {
+            // Never use more than about half a core: wait at least as long
+            // as the last frame took to draw before animating again.
+            const int period_ms = board->proc_face_anim_ms_.load();
+            const int wait_ms = std::max(period_ms, last_render_ms);
+            const bool woken = ulTaskNotifyTake(
+                pdTRUE, period_ms > 0 ? pdMS_TO_TICKS(wait_ms) : portMAX_DELAY) > 0;
+            if (board->display_ == nullptr || board->avatar_img_ == nullptr ||
+                board->proc_face_scratch_ == nullptr || board->avatar_set_.is_loaded() ||
+                board->gif_playing_.load()) {
+                continue;
+            }
+            for (int attempt = 0; attempt < 3; attempt++) {
+                const uint32_t generation = board->proc_face_generation_.load();
+                const auto state = board->CurrentFaceState();
+                const bool changed = generation != drawn_generation;
+                if (!changed && (!woken && (board->clock_visible_ || period_ms == 0 ||
+                                            !procedural_face::IsAnimated(state.expression)))) {
+                    break;  // nothing new and nothing moving
+                }
+                const int64_t t0 = esp_timer_get_time();
+                procedural_face::Render(state, procedural_face::Theme{}, board->proc_face_scratch_,
+                                        kProcFaceW, kProcFaceH);
+                const int64_t t1 = esp_timer_get_time();
+                DisplayLockGuard lock(board->display_);
+                const int64_t t2 = esp_timer_get_time();
+                const uint32_t render_us = static_cast<uint32_t>(t1 - t0);
+                last_render_ms = static_cast<int>(render_us / 1000);
+                const uint32_t lock_us = static_cast<uint32_t>(t2 - t1);
+                board->face_stat_frames_.fetch_add(1);
+                board->face_stat_render_us_sum_.fetch_add(render_us);
+                board->face_stat_lock_us_sum_.fetch_add(lock_us);
+                if (render_us > board->face_stat_render_us_max_.load()) board->face_stat_render_us_max_.store(render_us);
+                if (lock_us > board->face_stat_lock_us_max_.load()) board->face_stat_lock_us_max_.store(lock_us);
+                if (generation != board->proc_face_generation_.load()) {
+                    continue;  // state changed while drawing; draw again
+                }
+                if (board->current_avatar_face_ != "off") {
+                    const int back = board->proc_face_front_ ^ 1;
+                    memcpy(board->proc_face_buf_[back], board->proc_face_scratch_, bytes);
+                    board->ShowProceduralBackLocked(back);
+                }
+                drawn_generation = generation;
+                break;
+            }
+        }
+    }
+
+    void StartProceduralFaceAnimation() {
+        // Same priority (1) and core (1) as LVGL's task, so the two
+        // time-slice instead of the face starving the flush (at priority 2
+        // a ~250 ms frame preempted LVGL mid-frame and garbled the panel).
+        // Core 0 is no good: the always-on AFE / wake-word pipeline there
+        // starves a priority-1 task completely. Internal-RAM stack: with a
+        // PSRAM stack drawing took ~245 ms per frame instead of ~5 ms.
+        xTaskCreatePinnedToCore(ProceduralFaceAnimTask, "face_draw", 8 * 1024, this, 1,
+                                &proc_face_anim_task_, 1);
+        if (proc_face_anim_task_ == nullptr) {
+            ESP_LOGE(TAG, "Face draw task could not be created");
+        }
+    }
+#endif
+
+    // ---- Screen overlays (show_image / show_text) ------------------------
+
+    // Creates or restarts a one-shot timer that runs `fn` on this board.
+    void ArmOverlayTimer(esp_timer_handle_t& timer, const char* name,
+                         void (*fn)(void*), int seconds) {
+        if (timer == nullptr) {
+            esp_timer_create_args_t args = {
+                .callback = fn,
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = name,
+                .skip_unhandled_events = true,
+            };
+            if (esp_timer_create(&args, &timer) != ESP_OK) return;
+        }
+        esp_timer_stop(timer);
+        if (seconds > 0) {
+            esp_timer_start_once(timer, static_cast<uint64_t>(seconds) * 1000 * 1000);
+        }
+    }
+
+    void HideOverlayImage() {
+        if (overlay_image_timer_ != nullptr) esp_timer_stop(overlay_image_timer_);
+        if (display_ == nullptr) return;
+        DisplayLockGuard lock(display_);
+        if (overlay_image_ != nullptr) lv_obj_add_flag(overlay_image_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    void HideOverlayText() {
+        if (overlay_text_timer_ != nullptr) esp_timer_stop(overlay_text_timer_);
+        if (display_ == nullptr) return;
+        DisplayLockGuard lock(display_);
+        if (overlay_text_ != nullptr) lv_obj_add_flag(overlay_text_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    bool IsOverlayVisible() {
+        if (display_ == nullptr) return false;
+        DisplayLockGuard lock(display_);
+        bool image = overlay_image_ != nullptr && !lv_obj_has_flag(overlay_image_, LV_OBJ_FLAG_HIDDEN);
+        bool text = overlay_text_ != nullptr && !lv_obj_has_flag(overlay_text_, LV_OBJ_FLAG_HIDDEN);
+        return image || text || gif_playing_.load();
+    }
+
+    // Short-tap hook: hides any overlay and reports whether one was shown,
+    // so the tap is consumed instead of toggling listening.
+    bool DismissOverlaysOnTap() {
+        // The press itself already counts as activity and may have removed
+        // the clock a moment ago; swallow that tap too.
+        if (clock_visible_ || esp_timer_get_time() - clock_hidden_us_ < 1500 * 1000) {
+            HideClock();
+            return true;
+        }
+        if (!IsOverlayVisible()) return false;
+        HideOverlayImage();
+        HideOverlayText();
+        StopGif();
+        ESP_LOGI(TAG, "Overlay dismissed by tap");
+        return true;
+    }
+
+    struct OverlayImageJob {
+        StackChanBoard* board;
+        std::string url;
+        std::string token;
+        int seconds;
+    };
+
+    // Runs on its own task: downloads the RGB565 frame from the gateway's
+    // one-time staging URL and shows it. Tool calls run on the main loop,
+    // so the HTTP transfer must not happen there.
+    static void OverlayImageTask(void* arg) {
+        std::unique_ptr<OverlayImageJob> job(static_cast<OverlayImageJob*>(arg));
+        StackChanBoard* self = job->board;
+        std::string error = self->FetchOverlayImage(job->url, job->token);
+        if (error.empty()) {
+            self->ShowOverlayImage(job->seconds);
+        } else {
+            ESP_LOGW(TAG, "show_image failed: %s", error.c_str());
+        }
+        self->overlay_image_last_error_ = error;
+        self->overlay_image_loading_.store(false);
+        vTaskDelete(nullptr);
+    }
+
+    std::string FetchOverlayImage(const std::string& url, const std::string& token) {
+        if (overlay_image_buf_ == nullptr) {
+            overlay_image_buf_ = static_cast<uint8_t*>(
+                heap_caps_malloc(kOverlayImageBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            if (overlay_image_buf_ == nullptr) return "psram_oom";
+            overlay_image_dsc_.header.magic = LV_IMAGE_HEADER_MAGIC;
+            overlay_image_dsc_.header.cf = LV_COLOR_FORMAT_RGB565;
+            overlay_image_dsc_.header.w = kOverlayImageW;
+            overlay_image_dsc_.header.h = kOverlayImageH;
+            overlay_image_dsc_.header.stride = kOverlayImageW * 2;
+            overlay_image_dsc_.data_size = kOverlayImageBytes;
+            overlay_image_dsc_.data = overlay_image_buf_;
+        }
+        // Hide the previous picture before overwriting its pixels.
+        HideOverlayImage();
+
+        auto network = Board::GetInstance().GetNetwork();
+        if (network == nullptr) return "no_network";
+        auto http = network->CreateHttp(0);
+        if (http == nullptr) return "http_open_failed";
+        if (!token.empty()) {
+            http->SetHeader("Authorization", (std::string("Bearer ") + token).c_str());
+        }
+        if (!http->Open("GET", url)) return "http_open_failed";
+        if (http->GetStatusCode() != 200) {
+            http->Close();
+            return "http_status_" + std::to_string(http->GetStatusCode());
+        }
+        if (http->GetBodyLength() != kOverlayImageBytes) {
+            http->Close();
+            return "content_length_mismatch";
+        }
+        size_t total = 0;
+        while (total < kOverlayImageBytes) {
+            int n = http->Read(reinterpret_cast<char*>(overlay_image_buf_ + total),
+                               static_cast<int>(std::min<size_t>(4096, kOverlayImageBytes - total)));
+            if (n <= 0) {
+                http->Close();
+                return "read_failed";
+            }
+            total += static_cast<size_t>(n);
+        }
+        http->Close();
+        return "";
+    }
+
+    void ShowOverlayImage(int seconds) {
+        if (display_ == nullptr) return;
+        {
+            DisplayLockGuard lock(display_);
+            if (overlay_image_ == nullptr) {
+                overlay_image_ = lv_image_create(lv_layer_top());
+                if (overlay_image_ == nullptr) return;
+                lv_obj_center(overlay_image_);
+                lv_obj_clear_flag(overlay_image_, LV_OBJ_FLAG_SCROLLABLE);
+            }
+            lv_image_set_src(overlay_image_, &overlay_image_dsc_);
+            lv_obj_invalidate(overlay_image_);
+            lv_obj_clear_flag(overlay_image_, LV_OBJ_FLAG_HIDDEN);
+            // Keep any caption readable on top of the picture.
+            if (overlay_text_ != nullptr) lv_obj_move_foreground(overlay_text_);
+        }
+        HandleScreenActivity();
+        ArmOverlayTimer(overlay_image_timer_, "overlay_img",
+                        [](void* arg) { static_cast<StackChanBoard*>(arg)->HideOverlayImage(); },
+                        seconds);
+        ESP_LOGI(TAG, "show_image: shown for %d s (0 = until tap)", seconds);
+    }
+
+    // Queues a GIF; a playing one stops first. Returns false if the player
+    // task could not be created.
+    bool QueueGif(std::unique_ptr<GifJob> job) {
+        if (gif_mutex_ == nullptr) gif_mutex_ = xSemaphoreCreateMutex();
+        if (gif_mutex_ == nullptr) return false;
+        xSemaphoreTake(gif_mutex_, portMAX_DELAY);
+        gif_pending_ = std::move(job);
+        xSemaphoreGive(gif_mutex_);
+        gif_stop_.store(true);  // ends the current GIF; the task picks up the new one
+        if (gif_task_ == nullptr &&
+            xTaskCreatePinnedToCore(GifTask, "gif_play", 6144, this, 2, &gif_task_, 1) != pdPASS) {
+            gif_task_ = nullptr;
+            return false;
+        }
+        xTaskNotifyGive(gif_task_);
+        return true;
+    }
+
+    void StopGif() { gif_stop_.store(true); }
+
+    static void GifTask(void* arg) {
+        auto* self = static_cast<StackChanBoard*>(arg);
+        while (true) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            while (true) {
+                xSemaphoreTake(self->gif_mutex_, portMAX_DELAY);
+                std::unique_ptr<GifJob> job = std::move(self->gif_pending_);
+                xSemaphoreGive(self->gif_mutex_);
+                if (!job) break;
+                self->gif_stop_.store(false);
+                std::string error = self->PlayGif(*job);
+                if (!error.empty()) ESP_LOGW(TAG, "show_gif failed: %s", error.c_str());
+                self->gif_last_error_ = error;
+            }
+        }
+    }
+
+    bool EnsureGifBuffersLocked() {
+        if (gif_buf_ == nullptr) {
+            gif_buf_ = static_cast<uint16_t*>(
+                heap_caps_malloc(kOverlayImageBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            if (gif_buf_ == nullptr) return false;
+            auto& d = gif_dsc_;
+            d.header.magic = LV_IMAGE_HEADER_MAGIC;
+            d.header.cf = LV_COLOR_FORMAT_RGB565;
+            d.header.w = kOverlayImageW;
+            d.header.h = kOverlayImageH;
+            d.header.stride = kOverlayImageW * 2;
+            d.data_size = kOverlayImageBytes;
+            d.data = reinterpret_cast<const uint8_t*>(gif_buf_);
+        }
+        if (gif_img_ == nullptr) {
+            gif_img_ = lv_image_create(lv_layer_top());
+            if (gif_img_ == nullptr) return false;
+            lv_obj_center(gif_img_);
+            lv_obj_clear_flag(gif_img_, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(gif_img_, LV_OBJ_FLAG_HIDDEN);
+        }
+        return true;
+    }
+
+    std::string DownloadGif(const GifJob& job, std::unique_ptr<uint8_t, void (*)(void*)>& out) {
+        auto network = Board::GetInstance().GetNetwork();
+        if (network == nullptr) return "no_network";
+        auto http = network->CreateHttp(0);
+        if (http == nullptr) return "http_open_failed";
+        if (!job.token.empty()) {
+            http->SetHeader("Authorization", (std::string("Bearer ") + job.token).c_str());
+        }
+        if (!http->Open("GET", job.url)) return "http_open_failed";
+        if (http->GetStatusCode() != 200) {
+            http->Close();
+            return "http_status_" + std::to_string(http->GetStatusCode());
+        }
+        const size_t len = http->GetBodyLength();
+        if (len < 16 || len > kGifMaxBytes) {
+            http->Close();
+            return "bad_size_" + std::to_string(len);
+        }
+        out.reset(static_cast<uint8_t*>(heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)));
+        if (!out) {
+            http->Close();
+            return "psram_oom";
+        }
+        size_t total = 0;
+        while (total < len) {
+            int n = http->Read(reinterpret_cast<char*>(out.get() + total),
+                               static_cast<int>(std::min<size_t>(8192, len - total)));
+            if (n <= 0) {
+                http->Close();
+                return "read_failed";
+            }
+            total += static_cast<size_t>(n);
+        }
+        http->Close();
+        return "";
+    }
+
+    struct GifRect {
+        int x0 = 0, y0 = 0, x1 = -1, y1 = -1;  // inclusive, gif coordinates
+        bool empty() const { return x1 < x0 || y1 < y0; }
+        void add(int x, int y, int w, int h) {
+            if (w <= 0 || h <= 0) return;
+            if (empty()) {
+                *this = {x, y, x + w - 1, y + h - 1};
+                return;
+            }
+            x0 = std::min(x0, x);
+            y0 = std::min(y0, y);
+            x1 = std::max(x1, x + w - 1);
+            y1 = std::max(y1, y + h - 1);
+        }
+    };
+
+    // gifdec keeps the composited frame as B,G,R,A bytes; copy rectangle r
+    // of it, centred, into the RGB565 frame (transparent pixels become black).
+    // One 32-bit PSRAM read per pixel and -O2: this runs for every frame.
+    __attribute__((optimize("O2")))
+    static void GifCanvasToRgb565(const gd_GIF* gif, GifRect r, uint16_t* dst) {
+        const int w = std::min<int>(gif->width, kOverlayImageW);
+        const int h = std::min<int>(gif->height, kOverlayImageH);
+        const int ox = (kOverlayImageW - w) / 2, oy = (kOverlayImageH - h) / 2;
+        r.x1 = std::min(r.x1, w - 1);
+        r.y1 = std::min(r.y1, h - 1);
+        for (int y = r.y0; y <= r.y1; y++) {
+            // canvas rows start 4-byte aligned (gifdec allocates it after the
+            // struct with lv_malloc), so read whole B,G,R,A pixels at once.
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(gif->canvas) +
+                                  static_cast<size_t>(y) * gif->width + r.x0;
+            uint16_t* row = dst + (oy + y) * kOverlayImageW + ox;
+            for (int x = r.x0; x <= r.x1; x++) {
+                const uint32_t p = *src++;  // little-endian: B | G << 8 | R << 16 | A << 24
+                row[x] = (p >> 24) == 0 ? 0
+                                        : static_cast<uint16_t>(((p >> 8) & 0xF800) |
+                                                                ((p >> 5) & 0x07E0) | ((p >> 3) & 0x001F));
+            }
+        }
+    }
+
+    void SetGifVisibleLocked(bool visible) {
+        if (visible) {
+            lv_obj_clear_flag(gif_img_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_background(gif_img_);  // captions and subtitles stay on top
+            gif_hid_avatar_ = avatar_img_ != nullptr && !lv_obj_has_flag(avatar_img_, LV_OBJ_FLAG_HIDDEN);
+            if (gif_hid_avatar_) lv_obj_add_flag(avatar_img_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(gif_img_, LV_OBJ_FLAG_HIDDEN);
+            if (gif_hid_avatar_) lv_obj_clear_flag(avatar_img_, LV_OBJ_FLAG_HIDDEN);
+            gif_hid_avatar_ = false;
+        }
+    }
+
+    std::string PlayGif(const GifJob& job) {
+        if (display_ == nullptr) return "no_display";
+        std::unique_ptr<uint8_t, void (*)(void*)> data(nullptr, heap_caps_free);
+        std::string error = DownloadGif(job, data);
+        if (!error.empty()) return error;
+        gd_GIF* gif = gd_open_gif_data(data.get());
+        if (gif == nullptr) return "not_a_gif";
+        {
+            DisplayLockGuard lock(display_);
+            if (!EnsureGifBuffersLocked()) {
+                gd_close_gif(gif);
+                return "psram_oom";
+            }
+            memset(gif_buf_, 0, kOverlayImageBytes);
+            lv_image_set_src(gif_img_, &gif_dsc_);
+        }
+        HideOverlayImage();
+        gif_playing_.store(true);
+        HandleScreenActivity();
+        ESP_LOGI(TAG, "show_gif: %ux%u, seconds=%d loops=%d fast=%d", gif->width, gif->height,
+                 job.seconds, job.loops, job.fast);
+
+        const int gw = std::min<int>(gif->width, kOverlayImageW);
+        const int gh = std::min<int>(gif->height, kOverlayImageH);
+        const int ox = (kOverlayImageW - gw) / 2, oy = (kOverlayImageH - gh) / 2;
+        const int64_t start_us = esp_timer_get_time();
+        const int64_t end_us = job.seconds > 0 ? start_us + int64_t(job.seconds) * 1000000 : INT64_MAX;
+        int loops_done = 0, frames = 0;
+        int64_t decode_us = 0, convert_us = 0, refresh_us = 0, slept_at = start_us;
+        int64_t dirty_px = 0;
+        bool shown = false, full = true;
+        GifRect prev;  // previous frame's rect, if its disposal changes it now
+        while (!gif_stop_.load() && esp_timer_get_time() < end_us) {
+            const int64_t t0 = esp_timer_get_time();
+            // For looping GIFs gifdec silently seeks back at the end; with
+            // loop_count 1 it reports the end (0) so loops can be counted.
+            gif->loop_count = 1;
+            const int got = gd_get_frame(gif);
+            if (got < 0) {
+                error = "decode_failed";
+                break;
+            }
+            if (got == 0) {  // trailer: one loop finished
+                if (++loops_done >= job.loops && job.loops > 0) break;
+                gd_rewind(gif);
+                full = true;  // the first frame rebuilds the whole canvas
+                continue;
+            }
+            // gd_get_frame only decodes; draw the frame onto the canvas, as
+            // LVGL's own GIF widget does. (Without this the canvas lags a
+            // frame and the partial redraw below copies stale pixels.)
+            gd_render_frame(gif, gif->canvas);
+            const int64_t t1 = esp_timer_get_time();
+            // gd_get_frame first applied the previous frame's disposal (only
+            // modes 2 and 3 change pixels), then this frame's rect was drawn.
+            GifRect dirty = prev;
+            dirty.add(gif->fx, gif->fy, gif->fw, gif->fh);
+            prev = {};
+            if (gif->gce.disposal == 2 || gif->gce.disposal == 3) {
+                prev.add(gif->fx, gif->fy, gif->fw, gif->fh);
+            } else {
+                // gifdec's dispose() would draw this frame onto the canvas a
+                // second time at the start of the next frame; it is already
+                // there, so make that a no-op ("restore previous" in gifdec).
+                gif->gce.disposal = 3;
+            }
+            if (full) dirty = {0, 0, gw - 1, gh - 1};
+            full = false;
+            int64_t t2 = t1;
+            if (!dirty.empty()) {
+                DisplayLockGuard lock(display_);
+                GifCanvasToRgb565(gif, dirty, gif_buf_);
+                t2 = esp_timer_get_time();
+                if (!shown) {
+                    SetGifVisibleLocked(true);
+                    lv_obj_invalidate(gif_img_);
+                    shown = true;
+                } else {
+                    lv_area_t area = {static_cast<int32_t>(ox + dirty.x0), static_cast<int32_t>(oy + dirty.y0),
+                                      static_cast<int32_t>(ox + dirty.x1), static_cast<int32_t>(oy + dirty.y1)};
+                    lv_obj_invalidate_area(gif_img_, &area);
+                }
+                lv_refr_now(nullptr);  // draw this frame now; none get skipped
+                dirty_px += int64_t(dirty.x1 - dirty.x0 + 1) * (dirty.y1 - dirty.y0 + 1);
+            }
+            const int64_t t3 = esp_timer_get_time();
+            decode_us += t1 - t0;
+            convert_us += t2 - t1;
+            refresh_us += t3 - t2;
+            frames++;
+            NoteActivity();  // no clock screensaver mid-GIF
+            // GIF delays are in 1/100 s; browsers treat 0-1 as 100 ms.
+            const int delay_ms = job.fast ? 0 : (gif->gce.delay < 2 ? 100 : gif->gce.delay * 10);
+            const int64_t wait_us = t0 + int64_t(delay_ms) * 1000 - esp_timer_get_time();
+            if (wait_us >= 1000) {
+                vTaskDelay(std::max<TickType_t>(1, pdMS_TO_TICKS(wait_us / 1000)));
+                slept_at = esp_timer_get_time();
+            } else if (esp_timer_get_time() - slept_at > 50000) {
+                // Flat out: still let LVGL input and the idle task (watchdog)
+                // on this core run, but only once per 50 ms (a tick is 10 ms).
+                vTaskDelay(1);
+                slept_at = esp_timer_get_time();
+            }
+        }
+        const int64_t elapsed_us = esp_timer_get_time() - start_us;
+        gif_fps_x10_.store(elapsed_us > 0 ? static_cast<int>(int64_t(frames) * 10000000 / elapsed_us) : 0);
+        if (frames > 0) {
+            char stats[160];
+            snprintf(stats, sizeof(stats),
+                     "%d frames, per frame: decode %d ms, convert %d ms, refresh %d ms, %d%% of screen",
+                     frames, static_cast<int>(decode_us / frames / 1000),
+                     static_cast<int>(convert_us / frames / 1000), static_cast<int>(refresh_us / frames / 1000),
+                     static_cast<int>(dirty_px * 100 / frames / (kOverlayImageW * kOverlayImageH)));
+            gif_last_stats_ = stats;
+        }
+        gd_close_gif(gif);
+        {
+            DisplayLockGuard lock(display_);
+            SetGifVisibleLocked(false);
+        }
+        gif_playing_.store(false);
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+        {
+            // The face task skipped frames while the GIF played: redraw now.
+            DisplayLockGuard lock(display_);
+            if (current_avatar_face_ != "off" && !avatar_set_.is_loaded()) RenderProceduralFaceLocked();
+        }
+#endif
+        ESP_LOGI(TAG, "show_gif: %.1f fps, %s", gif_fps_x10_.load() / 10.0, gif_last_stats_.c_str());
+        return error;
+    }
+
+    bool ShowOverlayText(const std::string& text, int seconds, const std::string& position) {
+        if (display_ == nullptr) return false;
+        {
+            DisplayLockGuard lock(display_);
+            if (overlay_text_ == nullptr) {
+                overlay_text_ = lv_label_create(lv_layer_top());
+                if (overlay_text_ == nullptr) return false;
+                lv_obj_set_width(overlay_text_, 300);
+                lv_label_set_long_mode(overlay_text_, LV_LABEL_LONG_WRAP);
+                lv_obj_set_style_text_align(overlay_text_, LV_TEXT_ALIGN_CENTER, 0);
+                lv_obj_set_style_text_color(overlay_text_, lv_color_white(), 0);
+                lv_obj_set_style_bg_color(overlay_text_, lv_color_black(), 0);
+                lv_obj_set_style_bg_opa(overlay_text_, LV_OPA_80, 0);
+                lv_obj_set_style_pad_all(overlay_text_, 8, 0);
+                lv_obj_set_style_radius(overlay_text_, 10, 0);
+                auto* theme = static_cast<LvglTheme*>(display_->GetTheme());
+                if (theme != nullptr && theme->text_font() != nullptr) {
+                    lv_obj_set_style_text_font(overlay_text_, theme->text_font()->font(), 0);
+                }
+            }
+            lv_label_set_text(overlay_text_, text.c_str());
+            lv_align_t align = position == "top"      ? LV_ALIGN_TOP_MID
+                               : position == "center" ? LV_ALIGN_CENTER
+                                                      : LV_ALIGN_BOTTOM_MID;
+            int dy = position == "top" ? 8 : (position == "center" ? 0 : -8);
+            lv_obj_align(overlay_text_, align, 0, dy);
+            lv_obj_clear_flag(overlay_text_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(overlay_text_);
+        }
+        HandleScreenActivity();
+        ArmOverlayTimer(overlay_text_timer_, "overlay_txt",
+                        [](void* arg) { static_cast<StackChanBoard*>(arg)->HideOverlayText(); },
+                        seconds);
+        return true;
+    }
+
+    // ---- Status icons (Wi-Fi / battery) ----------------------------------
+
+    static lv_obj_t* CreateStatusLabel(const lv_font_t* font) {
+        lv_obj_t* label = lv_label_create(lv_layer_top());
+        if (label == nullptr) return nullptr;
+        lv_obj_set_style_text_color(label, lv_color_white(), 0);
+        lv_obj_set_style_text_opa(label, LV_OPA_70, 0);
+        if (font != nullptr) lv_obj_set_style_text_font(label, font, 0);
+        lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);
+        return label;
+    }
+
+    void UpdateStatusIcons() {
+        if (display_ == nullptr) return;
+        const char* wifi_icon = GetNetworkStateIcon();
+        int level = 0;
+        bool charging = false, discharging = false;
+        const bool have_battery = GetBatteryLevel(level, charging, discharging);
+        level = std::max(0, std::min(level, 100));
+        static const char* const kLevels[] = {
+            FONT_AWESOME_BATTERY_EMPTY, FONT_AWESOME_BATTERY_QUARTER,
+            FONT_AWESOME_BATTERY_HALF,  FONT_AWESOME_BATTERY_THREE_QUARTERS,
+            FONT_AWESOME_BATTERY_FULL,  FONT_AWESOME_BATTERY_FULL,
+        };
+        const char* battery_icon = charging ? FONT_AWESOME_BATTERY_BOLT : kLevels[level / 20];
+        const std::string percent = std::to_string(level) + "%";
+
+        DisplayLockGuard lock(display_);
+        if (status_wifi_label_ == nullptr) {
+            auto* theme = static_cast<LvglTheme*>(display_->GetTheme());
+            const lv_font_t* icon_font =
+                theme != nullptr && theme->icon_font() != nullptr ? theme->icon_font()->font() : nullptr;
+            const lv_font_t* text_font =
+                theme != nullptr && theme->text_font() != nullptr ? theme->text_font()->font() : nullptr;
+            if (icon_font == nullptr || text_font == nullptr) {
+                return;  // UI fonts not set up yet; retry on the next tick
+            }
+            status_wifi_label_ = CreateStatusLabel(icon_font);
+            status_battery_label_ = CreateStatusLabel(icon_font);
+            status_battery_pct_label_ = CreateStatusLabel(text_font);
+            if (status_wifi_label_ == nullptr || status_battery_label_ == nullptr ||
+                status_battery_pct_label_ == nullptr) {
+                return;
+            }
+            lv_obj_align(status_wifi_label_, LV_ALIGN_TOP_LEFT, 6, 4);
+            lv_obj_align(status_battery_label_, LV_ALIGN_TOP_RIGHT, -6, 4);
+        }
+        // Wi-Fi icon colour shows the whole link: red = no Wi-Fi or no
+        // gateway, orange = gateway up but no Claude client, white = ready.
+        const bool gateway_up = Application::GetInstance().IsGatewayConnected();
+        lv_color_t link_color = !gateway_up                 ? lv_color_hex(0xFF4040)
+                                : !claude_connected_.load() ? lv_color_hex(0xFFA030)
+                                                            : lv_color_white();
+        lv_obj_set_style_text_color(status_wifi_label_, link_color, 0);
+        lv_obj_set_style_text_opa(status_wifi_label_, gateway_up && claude_connected_.load() ? LV_OPA_70 : LV_OPA_COVER, 0);
+        lv_label_set_text(status_wifi_label_, wifi_icon != nullptr ? wifi_icon : "");
+        if (have_battery) {
+            const bool low = level < 20 && !charging;
+            const lv_color_t battery_color = low ? lv_color_hex(0xFF4040) : lv_color_white();
+            const lv_opa_t battery_opa = low ? LV_OPA_COVER : LV_OPA_70;
+            lv_obj_set_style_text_color(status_battery_label_, battery_color, 0);
+            lv_obj_set_style_text_color(status_battery_pct_label_, battery_color, 0);
+            lv_obj_set_style_text_opa(status_battery_label_, battery_opa, 0);
+            lv_obj_set_style_text_opa(status_battery_pct_label_, battery_opa, 0);
+            lv_label_set_text(status_battery_label_, battery_icon);
+            lv_label_set_text(status_battery_pct_label_, percent.c_str());
+            lv_obj_clear_flag(status_battery_label_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(status_battery_pct_label_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_update_layout(status_battery_label_);
+            lv_obj_align_to(status_battery_pct_label_, status_battery_label_,
+                            LV_ALIGN_OUT_LEFT_MID, -4, 0);
+        } else {
+            lv_obj_add_flag(status_battery_label_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(status_battery_pct_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_move_foreground(status_wifi_label_);
+        lv_obj_move_foreground(status_battery_label_);
+        lv_obj_move_foreground(status_battery_pct_label_);
+    }
+
+    // Re-sends the ILI9342 state that a corrupted SPI byte can knock out
+    // (sleep, display on, pixel format, inversion, address mode). Busy
+    // full-screen animation at high SPI clock occasionally turned the panel
+    // dark until a re-init; this makes any such glitch heal within seconds.
+    // Runs under the display lock so it never interleaves with a flush.
+    void RefreshLcdState() {
+        if (display_ == nullptr || lcd_panel_ == nullptr || lcd_panel_io_ == nullptr) return;
+        if (!lcd_refresh_enabled_.load()) return;
+        DisplayLockGuard lock(display_);
+        esp_lcd_panel_io_tx_param(lcd_panel_io_, 0x11, nullptr, 0);  // SLPOUT
+        vTaskDelay(pdMS_TO_TICKS(5));
+        esp_lcd_panel_io_tx_param(lcd_panel_io_, 0x13, nullptr, 0);  // NORON
+        esp_lcd_panel_io_tx_param(lcd_panel_io_, 0x38, nullptr, 0);  // IDMOFF
+        const uint8_t colmod = 0x55;                                  // 16 bpp
+        esp_lcd_panel_io_tx_param(lcd_panel_io_, 0x3A, &colmod, 1);
+        esp_lcd_panel_invert_color(lcd_panel_, true);
+        esp_lcd_panel_swap_xy(lcd_panel_, DISPLAY_SWAP_XY);           // re-sends MADCTL
+        esp_lcd_panel_mirror(lcd_panel_, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
+        esp_lcd_panel_disp_on_off(lcd_panel_, true);                  // DISPON
+    }
+
+    void StartLcdRefresh() {
+        esp_timer_create_args_t args = {
+            .callback = [](void* arg) { static_cast<StackChanBoard*>(arg)->RefreshLcdState(); },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "lcd_refresh",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&args, &lcd_refresh_timer_) == ESP_OK) {
+            esp_timer_start_periodic(lcd_refresh_timer_, 5 * 1000 * 1000);
+        }
+    }
+
+    void StartStatusIcons() {
+        esp_timer_create_args_t args = {
+            .callback = [](void* arg) { static_cast<StackChanBoard*>(arg)->UpdateStatusIcons(); },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "status_icons",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&args, &status_icons_timer_) == ESP_OK) {
+            esp_timer_start_periodic(status_icons_timer_, 5 * 1000 * 1000);
+        }
+    }
+
+    // ---- Bottom strip: ticker + subtitles ---------------------------------
+
+    static constexpr int kStripH = 30;
+
+    bool EnsureStripLocked() {
+        if (strip_bar_ != nullptr) return true;
+        strip_bar_ = lv_obj_create(lv_layer_top());
+        if (strip_bar_ == nullptr) return false;
+        lv_obj_remove_style_all(strip_bar_);
+        lv_obj_set_size(strip_bar_, 320, kStripH);
+        lv_obj_align(strip_bar_, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_style_bg_color(strip_bar_, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(strip_bar_, LV_OPA_70, 0);
+        lv_obj_clear_flag(strip_bar_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(strip_bar_, LV_OBJ_FLAG_CLICKABLE);
+        strip_label_ = lv_label_create(strip_bar_);
+        if (strip_label_ == nullptr) return false;
+        lv_obj_set_width(strip_label_, 308);
+        lv_label_set_long_mode(strip_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_set_style_text_align(strip_label_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(strip_label_, lv_color_white(), 0);
+        auto* theme = static_cast<LvglTheme*>(display_->GetTheme());
+        if (theme != nullptr && theme->text_font() != nullptr) {
+            lv_obj_set_style_text_font(strip_label_, theme->text_font()->font(), 0);
+        }
+        lv_obj_center(strip_label_);
+        lv_obj_add_flag(strip_bar_, LV_OBJ_FLAG_HIDDEN);
+        return true;
+    }
+
+    // Subtitles scroll through once, slowly: the first words stay put for
+    // kSubtitleLeadMs, then the line moves left until its end is on screen
+    // and stops there. Readable beats keeping pace with fast speech, so a
+    // long line can still be moving after the audio ends; a clear that
+    // arrives then waits for the scroll (see SetSubtitle).
+    static constexpr int kSubtitleMaxPxS = 45;
+    static constexpr int kSubtitleMinPxS = 20;
+    static constexpr int kSubtitleLeadMs = 1000;
+    static constexpr int kSubtitleHoldMs = 1500;
+    static constexpr int kStripTextW = 308;
+
+    // Shows the subtitle if one is active, else the ticker, else nothing.
+    // Caller holds the display lock.
+    void ApplyStripLocked() {
+        if (!EnsureStripLocked()) return;
+        lv_anim_delete(strip_label_, nullptr);
+        subtitle_scroll_end_us_ = 0;
+        const bool subtitle = !subtitle_text_.empty();
+        const std::string& text = subtitle ? subtitle_text_ : ticker_text_;
+        if (text.empty()) {
+            lv_obj_add_flag(strip_bar_, LV_OBJ_FLAG_HIDDEN);
+            return;
+        }
+        const lv_font_t* font = lv_obj_get_style_text_font(strip_label_, LV_PART_MAIN);
+        int text_w = 0;
+        if (font != nullptr) {
+            lv_point_t size = {0, 0};
+            lv_text_get_size(&size, text.c_str(), font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+            text_w = static_cast<int>(size.x);
+        }
+        lv_obj_set_style_text_color(strip_label_,
+                                    subtitle ? lv_color_hex(0xFFE680) : lv_color_white(), 0);
+        lv_label_set_text(strip_label_, text.c_str());
+        if (subtitle) {
+            ShowSubtitleLocked(text_w);
+        } else {
+            ShowTickerLocked(font, text_w);
+        }
+        lv_obj_clear_flag(strip_bar_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(strip_bar_);
+    }
+
+    void ShowSubtitleLocked(int text_w) {
+        lv_label_set_long_mode(strip_label_, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(strip_label_, LV_SIZE_CONTENT);
+        const int margin = (320 - kStripTextW) / 2;
+        if (text_w <= kStripTextW) {
+            lv_obj_align(strip_label_, LV_ALIGN_CENTER, 0, 0);
+            return;
+        }
+        const int travel = text_w - kStripTextW;
+        const int scroll_ms = std::max(subtitle_duration_ms_ - kSubtitleLeadMs, 1);
+        const int speed = std::clamp(static_cast<int>(int64_t(travel) * 1000 / scroll_ms),
+                                     kSubtitleMinPxS, kSubtitleMaxPxS);
+        const uint32_t duration = static_cast<uint32_t>(int64_t(travel) * 1000 / speed);
+        lv_obj_align(strip_label_, LV_ALIGN_LEFT_MID, margin, 0);
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, strip_label_);
+        lv_anim_set_exec_cb(&a, [](void* obj, int32_t x) {
+            lv_obj_set_x(static_cast<lv_obj_t*>(obj), x);
+        });
+        lv_anim_set_values(&a, margin, margin - travel);
+        lv_anim_set_delay(&a, kSubtitleLeadMs);
+        lv_anim_set_duration(&a, duration);
+        lv_anim_set_repeat_count(&a, 0);
+        lv_anim_start(&a);
+        subtitle_scroll_end_us_ =
+            esp_timer_get_time() + int64_t(kSubtitleLeadMs + duration) * 1000;
+    }
+
+    void ShowTickerLocked(const lv_font_t* font, int text_w) {
+        lv_obj_set_width(strip_label_, kStripTextW);
+        lv_label_set_long_mode(strip_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_center(strip_label_);
+        const int speed = ticker_speed_px_s_;
+        uint32_t anim_duration = lv_anim_speed(speed);
+        if (font != nullptr) {
+            // Pass a plain loop time in ms rather than lv_anim_speed*():
+            // LVGL caps encoded speeds at ~10 s per loop, so long ticker
+            // text raced past at hundreds of px/s whatever speed was asked.
+            // Travel matches lv_label's circular scroll (text + wait chars).
+            int travel = text_w + lv_font_get_glyph_width(font, ' ', ' ') * LV_LABEL_WAIT_CHAR_COUNT;
+            anim_duration = std::max<uint32_t>(200, static_cast<uint32_t>(travel) * 1000U / speed);
+        }
+        lv_obj_set_style_anim_duration(strip_label_, anim_duration, 0);
+    }
+
+    void SetTicker(const std::string& text, int seconds, int speed) {
+        if (display_ == nullptr) return;
+        ticker_text_ = text;
+        ticker_speed_px_s_ = std::max(10, std::min(speed, 400));
+        {
+            DisplayLockGuard lock(display_);
+            ApplyStripLocked();
+        }
+        ArmOverlayTimer(ticker_timer_, "ticker",
+                        [](void* arg) {
+                            auto* self = static_cast<StackChanBoard*>(arg);
+                            self->SetTicker("", 0, self->ticker_speed_px_s_);
+                        },
+                        text.empty() ? 0 : seconds);
+    }
+
+    // An empty text clears the subtitle, but not before a running scroll has
+    // reached the end and been readable for kSubtitleHoldMs.
+    void SetSubtitle(const std::string& text, int duration_ms) {
+        if (display_ == nullptr) return;
+        if (subtitle_clear_timer_ == nullptr) {
+            esp_timer_create_args_t args = {
+                .callback = [](void* arg) {
+                    auto* self = static_cast<StackChanBoard*>(arg);
+                    DisplayLockGuard lock(self->display_);
+                    self->subtitle_text_.clear();
+                    self->ApplyStripLocked();
+                },
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "subtitle_clear",
+                .skip_unhandled_events = true,
+            };
+            esp_timer_create(&args, &subtitle_clear_timer_);
+        }
+        if (subtitle_clear_timer_ != nullptr) esp_timer_stop(subtitle_clear_timer_);
+        DisplayLockGuard lock(display_);
+        if (text.empty() && !subtitle_text_.empty() && subtitle_clear_timer_ != nullptr) {
+            const int64_t wait_us = subtitle_scroll_end_us_ - esp_timer_get_time();
+            if (wait_us > 0) {
+                esp_timer_start_once(subtitle_clear_timer_, wait_us + kSubtitleHoldMs * 1000);
+                return;
+            }
+        }
+        subtitle_text_ = text;
+        subtitle_duration_ms_ = duration_ms;
+        ApplyStripLocked();
+    }
+
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+    static constexpr const char* kFaceStyleNvsKey = "face_style";
+
+    void LoadFaceStyle() {
+        Settings settings(STACKCHAN_SCREEN_OFF_NVS_NAMESPACE, false);
+        int idx = procedural_face::StyleFromName(settings.GetString(kFaceStyleNvsKey, "stackchan").c_str());
+        face_style_ = static_cast<procedural_face::Style>(idx < 0 ? 0 : idx);
+        ESP_LOGI(TAG, "Face style: %s", procedural_face::StyleName(face_style_));
+    }
+
+    bool SetFaceStyle(const std::string& name) {
+        int idx = procedural_face::StyleFromName(name.c_str());
+        if (idx < 0) return false;
+        face_style_ = static_cast<procedural_face::Style>(idx);
+        {
+            Settings settings(STACKCHAN_SCREEN_OFF_NVS_NAMESPACE, true);
+            settings.SetString(kFaceStyleNvsKey, procedural_face::StyleName(face_style_));
+        }
+        if (display_ != nullptr) {
+            DisplayLockGuard lock(display_);
+            if (avatar_img_ != nullptr && current_avatar_face_ != "off") RenderAvatarLocked();
+        }
+        return true;
+    }
+#endif
+
+    // ---- Clock screensaver ------------------------------------------------
+
+    void NoteActivity() { last_activity_us_.store(esp_timer_get_time()); }
+
+    void StartSntpOnce() {
+        if (sntp_started_) return;
+        sntp_started_ = true;
+#ifdef CONFIG_STACKCHAN_TIMEZONE
+        setenv("TZ", CONFIG_STACKCHAN_TIMEZONE, 1);
+        tzset();
+#endif
+        esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        if (esp_netif_sntp_init(&config) != ESP_OK) {
+            ESP_LOGW(TAG, "SNTP init failed");
+            sntp_started_ = false;
+            return;
+        }
+        ESP_LOGI(TAG, "SNTP started (pool.ntp.org)");
+    }
+
+    static bool LocalTimeValid(struct tm* out) {
+        time_t now = time(nullptr);
+        localtime_r(&now, out);
+        return out->tm_year >= 2024 - 1900;
+    }
+
+    bool EnsureClockObjects() {
+        if (clock_buf_ == nullptr) {
+            const size_t bytes = 320 * 240 * 2;
+            clock_buf_ = static_cast<uint16_t*>(
+                heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            if (clock_buf_ == nullptr) return false;
+            clock_dsc_.header.magic = LV_IMAGE_HEADER_MAGIC;
+            clock_dsc_.header.cf = LV_COLOR_FORMAT_RGB565;
+            clock_dsc_.header.w = 320;
+            clock_dsc_.header.h = 240;
+            clock_dsc_.header.stride = 320 * 2;
+            clock_dsc_.data_size = bytes;
+            clock_dsc_.data = reinterpret_cast<const uint8_t*>(clock_buf_);
+        }
+        if (clock_img_ == nullptr) {
+            clock_img_ = lv_image_create(lv_layer_top());
+            if (clock_img_ == nullptr) return false;
+            lv_obj_center(clock_img_);
+            lv_obj_add_flag(clock_img_, LV_OBJ_FLAG_HIDDEN);
+            clock_date_ = lv_label_create(lv_layer_top());
+            if (clock_date_ != nullptr) {
+                lv_obj_set_style_text_color(clock_date_, lv_color_hex(0x909090), 0);
+                auto* theme = static_cast<LvglTheme*>(display_->GetTheme());
+                if (theme != nullptr && theme->text_font() != nullptr) {
+                    lv_obj_set_style_text_font(clock_date_, theme->text_font()->font(), 0);
+                }
+                lv_obj_add_flag(clock_date_, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        return true;
+    }
+
+    // Caller holds the display lock.
+    void DrawClockLocked(const struct tm& tm) {
+        procedural_face::Theme theme;
+        theme.foreground = 0xC618;  // soft grey, easy on the eyes
+        procedural_face::RenderClock(tm.tm_hour, tm.tm_min, true, theme, clock_buf_, 320, 240);
+        lv_image_set_src(clock_img_, &clock_dsc_);
+        lv_obj_invalidate(clock_img_);
+        if (clock_date_ != nullptr) {
+            char date[32];
+            strftime(date, sizeof(date), "%A %d %B", &tm);
+            lv_label_set_text(clock_date_, date);
+            lv_obj_align(clock_date_, LV_ALIGN_BOTTOM_MID, 0, -36);
+        }
+        clock_drawn_minute_ = tm.tm_hour * 60 + tm.tm_min;
+    }
+
+    void ShowClock(const struct tm& tm) {
+        if (display_ == nullptr) return;
+        DisplayLockGuard lock(display_);
+        if (!EnsureClockObjects()) return;
+        DrawClockLocked(tm);
+        lv_obj_clear_flag(clock_img_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(clock_img_);
+        if (clock_date_ != nullptr) {
+            lv_obj_clear_flag(clock_date_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(clock_date_);
+        }
+        // Keep the Wi-Fi / battery icons visible on top of the clock.
+        if (status_wifi_label_ != nullptr) lv_obj_move_foreground(status_wifi_label_);
+        if (status_battery_label_ != nullptr) lv_obj_move_foreground(status_battery_label_);
+        if (status_battery_pct_label_ != nullptr) lv_obj_move_foreground(status_battery_pct_label_);
+        clock_visible_ = true;
+        clock_shown_us_ = esp_timer_get_time();
+        ESP_LOGI(TAG, "Clock screensaver shown");
+    }
+
+    void HideClock() {
+        if (!clock_visible_ || display_ == nullptr) return;
+        DisplayLockGuard lock(display_);
+        if (clock_img_ != nullptr) lv_obj_add_flag(clock_img_, LV_OBJ_FLAG_HIDDEN);
+        if (clock_date_ != nullptr) lv_obj_add_flag(clock_date_, LV_OBJ_FLAG_HIDDEN);
+        clock_visible_ = false;
+        clock_hidden_us_ = esp_timer_get_time();
+    }
+
+    void ClockTick() {
+        auto& app = Application::GetInstance();
+        const DeviceState state = app.GetDeviceState();
+        if (!sntp_started_ && state == kDeviceStateIdle) {
+            StartSntpOnce();
+        }
+        if (state != kDeviceStateIdle) {
+            NoteActivity();  // listening, speaking, connecting ...
+        }
+#if CONFIG_STACKCHAN_CLOCK_SCREENSAVER_SECONDS > 0
+        const int64_t now = esp_timer_get_time();
+        if (clock_visible_) {
+            if (last_activity_us_.load() > clock_shown_us_) {
+                HideClock();
+                return;
+            }
+            struct tm tm;
+            if (LocalTimeValid(&tm) && tm.tm_hour * 60 + tm.tm_min != clock_drawn_minute_) {
+                DisplayLockGuard lock(display_);
+                DrawClockLocked(tm);
+            }
+            return;
+        }
+        if (avatar_img_ == nullptr || current_avatar_face_ == "off" || IsOverlayVisible()) {
+            return;  // face not up yet (e.g. Wi-Fi setup) or a picture is showing
+        }
+        if (now - last_activity_us_.load() <
+            int64_t(CONFIG_STACKCHAN_CLOCK_SCREENSAVER_SECONDS) * 1000 * 1000) {
+            return;
+        }
+        struct tm tm;
+        if (LocalTimeValid(&tm)) {
+            ShowClock(tm);
+        }
+#endif
+    }
+
+    void StartClockTimer() {
+        NoteActivity();
+        esp_timer_create_args_t args = {
+            .callback = [](void* arg) { static_cast<StackChanBoard*>(arg)->ClockTick(); },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "clock_saver",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&args, &clock_tick_timer_) == ESP_OK) {
+            esp_timer_start_periodic(clock_tick_timer_, 1000 * 1000);
+        }
     }
 
     // ---- Avatar fetch pending machinery (intent doc invariant #6) -------
@@ -5048,6 +6510,7 @@ private:
     // "off" (avatar layer hidden), the layer is unhidden here, and if blink
     // was enabled before SetAvatarOff() ran it is restored automatically.
     bool SetAvatarExpression(const char* face) {
+        NoteActivity();
         if (display_ == nullptr) {
             ESP_LOGW(TAG, "SetAvatarExpression('%s') ignored: display_ not ready", face);
             return false;
@@ -5868,11 +7331,325 @@ private:
         ESP_LOGI(TAG, "Registering StackChan MCP tools...");
 
         mcp_server.AddTool(
+            "self.display.show_image",
+            "Download a 320x240 RGB565 picture (153600 bytes) from url and show...",
+            PropertyList({
+                Property("url", kPropertyTypeString),
+                Property("token", kPropertyTypeString, std::string("")),
+                Property("seconds", kPropertyTypeInteger, 10, 0, 3600),
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+                if (overlay_image_loading_.exchange(true)) {
+                    cJSON_AddBoolToObject(root, "ok", false);
+                    cJSON_AddStringToObject(root, "error", "busy: previous image still loading");
+                    return root;
+                }
+                auto* job = new OverlayImageJob{
+                    this,
+                    properties["url"].value<std::string>(),
+                    properties["token"].value<std::string>(),
+                    properties["seconds"].value<int>(),
+                };
+                if (xTaskCreate(OverlayImageTask, "overlay_img", 6144, job, 4, nullptr) != pdPASS) {
+                    delete job;
+                    overlay_image_loading_.store(false);
+                    cJSON_AddBoolToObject(root, "ok", false);
+                    cJSON_AddStringToObject(root, "error", "task_create_failed");
+                    return root;
+                }
+                cJSON_AddBoolToObject(root, "ok", true);
+                cJSON_AddStringToObject(root, "status", "loading");
+                if (!overlay_image_last_error_.empty()) {
+                    cJSON_AddStringToObject(root, "previous_error", overlay_image_last_error_.c_str());
+                }
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.display.show_gif",
+            "Download an animated GIF (prepared by the gateway) and play it full screen.",
+            PropertyList({
+                Property("url", kPropertyTypeString),
+                Property("token", kPropertyTypeString, std::string("")),
+                Property("seconds", kPropertyTypeInteger, 15, 0, 3600),
+                Property("loops", kPropertyTypeInteger, 0, 0, 1000),
+                Property("fast", kPropertyTypeBoolean, false),
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                auto job = std::make_unique<GifJob>();
+                job->url = properties["url"].value<std::string>();
+                job->token = properties["token"].value<std::string>();
+                job->seconds = properties["seconds"].value<int>();
+                job->loops = properties["loops"].value<int>();
+                job->fast = properties["fast"].value<bool>();
+                cJSON* root = cJSON_CreateObject();
+                const bool ok = QueueGif(std::move(job));
+                cJSON_AddBoolToObject(root, "ok", ok);
+                cJSON_AddStringToObject(root, "status", ok ? "loading" : "task_create_failed");
+                if (gif_fps_x10_.load() > 0) {
+                    cJSON_AddNumberToObject(root, "previous_fps", gif_fps_x10_.load() / 10.0);
+                    cJSON_AddStringToObject(root, "previous_stats", gif_last_stats_.c_str());
+                }
+                if (!gif_last_error_.empty()) {
+                    cJSON_AddStringToObject(root, "previous_error", gif_last_error_.c_str());
+                }
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.display.show_text",
+            "Show a caption above the face.",
+            PropertyList({
+                Property("text", kPropertyTypeString),
+                Property("seconds", kPropertyTypeInteger, 10, 0, 3600),
+                Property("position", kPropertyTypeString, std::string("bottom")),
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+                bool ok = ShowOverlayText(properties["text"].value<std::string>(),
+                                          properties["seconds"].value<int>(),
+                                          properties["position"].value<std::string>());
+                cJSON_AddBoolToObject(root, "ok", ok);
+                return root;
+            });
+
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+        mcp_server.AddTool(
+            "self.display.set_animation",
+            "Diagnostics: set the face animation period in ms (0 = no timed...",
+            PropertyList({Property("interval_ms", kPropertyTypeInteger, 200, 0, 5000)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                proc_face_anim_ms_.store(properties["interval_ms"].value<int>());
+                if (proc_face_anim_task_ != nullptr) xTaskNotifyGive(proc_face_anim_task_);
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", true);
+                cJSON_AddNumberToObject(root, "interval_ms", proc_face_anim_ms_.load());
+                return root;
+            });
+
+#if CONFIG_STACKCHAN_DIAGNOSTIC_TOOLS
+        mcp_server.AddTool(
+            "self.display.get_face_stats",
+            "Diagnostics: face frames drawn since the last call, with average and...",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                const uint32_t frames = face_stat_frames_.exchange(0);
+                const uint32_t rsum = face_stat_render_us_sum_.exchange(0);
+                const uint32_t lsum = face_stat_lock_us_sum_.exchange(0);
+                const uint32_t rmax = face_stat_render_us_max_.exchange(0);
+                const uint32_t lmax = face_stat_lock_us_max_.exchange(0);
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddNumberToObject(root, "frames", frames);
+                cJSON_AddNumberToObject(root, "render_avg_ms", frames ? rsum / 1000.0 / frames : 0);
+                cJSON_AddNumberToObject(root, "render_max_ms", rmax / 1000.0);
+                cJSON_AddNumberToObject(root, "lock_wait_avg_ms", frames ? lsum / 1000.0 / frames : 0);
+                cJSON_AddNumberToObject(root, "lock_wait_max_ms", lmax / 1000.0);
+                cJSON_AddNumberToObject(root, "interval_ms", proc_face_anim_ms_.load());
+                cJSON_AddNumberToObject(root, "free_internal_kb", heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
+                cJSON_AddNumberToObject(root, "min_free_internal_kb", heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024);
+                return root;
+            });
+#endif  // CONFIG_STACKCHAN_DIAGNOSTIC_TOOLS
+#endif
+
+#if CONFIG_STACKCHAN_DIAGNOSTIC_TOOLS
+        mcp_server.AddTool(
+            "self.system.get_task_stats",
+            "Diagnostics: CPU share of every task over a 2 s window, with the...",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                struct Sample { std::string name; uint32_t runtime; BaseType_t core; UBaseType_t prio; };
+                auto snapshot = [](std::vector<Sample>& out, uint32_t& total) {
+                    UBaseType_t n = uxTaskGetNumberOfTasks() + 4;
+                    std::vector<TaskStatus_t> st(n);
+                    n = uxTaskGetSystemState(st.data(), n, &total);
+                    out.clear();
+                    for (UBaseType_t i = 0; i < n; i++) {
+                        out.push_back({st[i].pcTaskName, st[i].ulRunTimeCounter,
+                                       xTaskGetCoreID(st[i].xHandle), st[i].uxCurrentPriority});
+                    }
+                };
+                std::vector<Sample> a, b;
+                uint32_t ta = 0, tb = 0;
+                snapshot(a, ta);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                snapshot(b, tb);
+                const double window = static_cast<double>(tb - ta);
+                cJSON* root = cJSON_CreateObject();
+                cJSON* tasks = cJSON_AddArrayToObject(root, "tasks");
+                for (const auto& s2 : b) {
+                    uint32_t before = 0;
+                    for (const auto& s1 : a) if (s1.name == s2.name) { before = s1.runtime; break; }
+                    double pct = window > 0 ? (s2.runtime - before) * 100.0 / window : 0;
+                    if (pct < 0.5) continue;
+                    cJSON* t = cJSON_CreateObject();
+                    cJSON_AddStringToObject(t, "task", s2.name.c_str());
+                    cJSON_AddNumberToObject(t, "cpu_pct_of_one_core", static_cast<int>(pct * 10) / 10.0);
+                    cJSON_AddNumberToObject(t, "core", s2.core > 1 ? -1 : s2.core);
+                    cJSON_AddNumberToObject(t, "prio", s2.prio);
+                    cJSON_AddItemToArray(tasks, t);
+                }
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.audio.set_wake_word",
+            "Diagnostics: turn wake-word detection on or off until the next state...",
+            PropertyList({Property("enabled", kPropertyTypeBoolean)}),
+            [](const PropertyList& properties) -> ReturnValue {
+                bool en = properties["enabled"].value<bool>();
+                Application::GetInstance().GetAudioService().EnableWakeWordDetection(en);
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", true);
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.display.set_lcd_refresh",
+            "Diagnostics: enable/disable the periodic LCD state re-send.",
+            PropertyList({Property("enabled", kPropertyTypeBoolean)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                lcd_refresh_enabled_.store(properties["enabled"].value<bool>());
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", true);
+                return root;
+            });
+
+#endif  // CONFIG_STACKCHAN_DIAGNOSTIC_TOOLS
+#if CONFIG_STACKCHAN_BODY_SENSORS
+        mcp_server.AddTool(
+            "self.sensors.get_motion",
+            "IMU reading: accel (g), gyro (deg/s), and whether it is being held.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                float a[3], g[3];
+                taskENTER_CRITICAL(&body_mux_);
+                std::copy(body_accel_, body_accel_ + 3, a);
+                std::copy(body_gyro_, body_gyro_ + 3, g);
+                taskEXIT_CRITICAL(&body_mux_);
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "available", imu_ != nullptr);
+                cJSON_AddItemToObject(root, "accel_g", cJSON_CreateFloatArray(a, 3));
+                cJSON_AddItemToObject(root, "gyro_dps", cJSON_CreateFloatArray(g, 3));
+                cJSON_AddBoolToObject(root, "held", motion_detector_.held());
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.sensors.get_proximity",
+            "Proximity (raw 0..2047, bigger = closer) and whether something is near.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                taskENTER_CRITICAL(&body_mux_);
+                const int raw = body_proximity_;
+                taskEXIT_CRITICAL(&body_mux_);
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "available", prox_ != nullptr);
+                cJSON_AddNumberToObject(root, "proximity", raw);
+                cJSON_AddNumberToObject(root, "baseline", proximity_detector_.baseline());
+                cJSON_AddBoolToObject(root, "near", proximity_detector_.near());
+                return root;
+            });
+#endif
+
+        mcp_server.AddTool(
+            "self.display.set_ticker",
+            "Scroll text along the bottom of the screen like a news ticker.",
+            PropertyList({
+                Property("text", kPropertyTypeString),
+                Property("seconds", kPropertyTypeInteger, 0, 0, 86400),
+                Property("speed", kPropertyTypeInteger, 60, 10, 400),
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                SetTicker(properties["text"].value<std::string>(),
+                          properties["seconds"].value<int>(),
+                          properties["speed"].value<int>());
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", true);
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.display.set_subtitle",
+            "Show a subtitle in the bottom strip (temporarily replacing any...",
+            PropertyList({
+                Property("text", kPropertyTypeString),
+                Property("duration_ms", kPropertyTypeInteger, 0, 0, 600000),
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                SetSubtitle(properties["text"].value<std::string>(),
+                            properties["duration_ms"].value<int>());
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", true);
+                return root;
+            });
+
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+        mcp_server.AddTool(
+            "self.display.set_face_style",
+            "Switch the drawn face's look: stackchan (white dots and line) or...",
+            PropertyList({Property("style", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                bool ok = SetFaceStyle(properties["style"].value<std::string>());
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", ok);
+                if (!ok) cJSON_AddStringToObject(root, "error", "unknown style; use stackchan or bender");
+                return root;
+            });
+#endif
+
+        mcp_server.AddTool(
+            "self.display.set_link_status",
+            "Tell the robot whether a Claude client is connected to the gateway.",
+            PropertyList({Property("claude_connected", kPropertyTypeBoolean)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                claude_connected_.store(properties["claude_connected"].value<bool>());
+                UpdateStatusIcons();
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", true);
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.display.clear_overlay",
+            "Hide any picture or caption shown with show_image / show_text.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                HideOverlayImage();
+                HideOverlayText();
+                StopGif();
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", true);
+                return root;
+            });
+
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+        mcp_server.AddTool(
+            "self.display.set_gaze",
+            "Point the face's eyes without moving the head.",
+            PropertyList({
+                Property("x", kPropertyTypeInteger, 0, -100, 100),
+                Property("y", kPropertyTypeInteger, 0, -100, 100),
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                gaze_x_ = properties["x"].value<int>() * 0.3f;
+                gaze_y_ = properties["y"].value<int>() * 0.2f;
+                bool ok = false;
+                if (display_ != nullptr) {
+                    DisplayLockGuard lock(display_);
+                    ok = avatar_img_ != nullptr && current_avatar_face_ != "off" &&
+                         RenderAvatarLocked();
+                }
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", ok);
+                return root;
+            });
+#endif
+
+        mcp_server.AddTool(
             "self.screen.set_off_timeout",
-            "Set the StackChan idle screen-off timeout in seconds. The value "
-            "is saved to NVS and applied immediately. Use 0 to disable idle "
-            "screen-off and wake the screen if it is currently off. Valid "
-            "range: 0..86400 seconds.",
+            "Set the StackChan idle screen-off timeout in seconds.",
             PropertyList({
                 Property("seconds", kPropertyTypeInteger, 0,
                          STACKCHAN_SCREEN_OFF_MAX_TIMEOUT_SECONDS)
@@ -5885,8 +7662,7 @@ private:
 
         mcp_server.AddTool(
             "self.screen.get_off_timeout",
-            "Get the effective NVS-backed StackChan idle screen-off timeout, "
-            "whether it is enabled, and whether the screen is currently off.",
+            "Get the effective NVS-backed StackChan idle screen-off timeout...",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 return GetScreenOffTimeoutJson();
@@ -5894,17 +7670,7 @@ private:
 
         mcp_server.AddTool(
             "self.gateway_config.get",
-            "Read the NVS-backed WebSocket gateway connection settings. "
-            "Returns websocket.url, websocket.fallback_url, token_set (never "
-            "the token value), forced_keys, force_mode, discovery_enabled, "
-            "and the current connected_url when a WebSocket candidate is "
-            "connected. Empty websocket.url enables mDNS discovery when "
-            "discovery support is compiled in and the primary URL is not "
-            "forced; websocket.fallback_url is tried after discovery and is "
-            "suitable for an out-of-LAN relay. forced_keys lists any of url, "
-            "fallback_url, and token that a non-empty Kconfig default "
-            "overrides at connect time; force_mode=true means at least one "
-            "key is forced.",
+            "Read the NVS-backed WebSocket gateway connection settings.",
             PropertyList(),
             [](const PropertyList&) -> ReturnValue {
                 Settings settings("websocket", false);
@@ -5928,19 +7694,7 @@ private:
 
         mcp_server.AddTool(
             "self.gateway_config.set",
-            "Update the NVS-backed WebSocket gateway connection settings. "
-            "Optional string fields: url, fallback_url, token. At least one "
-            "field must be provided. Passing an empty string clears that NVS "
-            "key. Leave url empty to enable mDNS discovery on the next "
-            "reconnect when discovery support is compiled in and the primary "
-            "URL is not forced; fallback_url is tried after discovery and is "
-            "suitable for an out-of-LAN relay. The change is persisted but "
-            "does not disconnect, reconnect, or reboot the device; it takes "
-            "effect on the next reconnect. forced_keys lists any of url, "
-            "fallback_url, and token that a non-empty Kconfig default "
-            "overrides at connect time; force_mode=true means at least one "
-            "key is forced, so updates to those keys are ignored until a "
-            "non-force build is flashed.",
+            "Update the NVS-backed WebSocket gateway connection settings.",
             PropertyList({Property("url", kPropertyTypeString, std::string()),
                           Property("fallback_url", kPropertyTypeString, std::string()),
                           Property("token", kPropertyTypeString, std::string())}),
@@ -6013,9 +7767,7 @@ private:
 
         mcp_server.AddTool(
             "self.robot.get_touch_sensor_enabled",
-            "Read the NVS-backed head-touch sensor enable flag. When disabled, "
-            "HandleTap / HandleStroke skip both the local motion response and "
-            "the stackchan/event emission.",
+            "Read the NVS-backed head-touch sensor enable flag.",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -6026,10 +7778,7 @@ private:
 
         mcp_server.AddTool(
             "self.robot.set_touch_sensor_enabled",
-            "Update the NVS-backed head-touch sensor enable flag. Disabling "
-            "takes effect immediately and persists across reboot; subsequent "
-            "HandleTap / HandleStroke calls skip both the local motion "
-            "response and the stackchan/event emission.",
+            "Update the NVS-backed head-touch sensor enable flag.",
             PropertyList({Property("enabled", kPropertyTypeBoolean)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 bool enabled = properties["enabled"].value<bool>();
@@ -6053,7 +7802,7 @@ private:
         // spot) above, plus Issue #80 / #98.
         mcp_server.AddTool(
             "self.robot.set_head_angles",
-            "Set the head angles of the robot. yaw: horizontal (-90 to 90). pitch: vertical. M5Stack-recommended operating range is 5 to 85 degrees per https://docs.m5stack.com/en/StackChan (\"Motion Angle Notice\"). The firmware also accepts values up to 88 degrees (the hard clamp guards against the audible sub-stall observed at pitch=89 on real hardware), but values outside 5-85 degrees are not officially endorsed and may stress the servo over time. Requests below 0 degrees or above 88 degrees are silently clamped with an ESP_LOGW. Optional speed_dps: angular speed in degrees per second. If omitted or zero, the existing duration-based default applies; positive values below 15 dps are clamped to the step-safe floor. See README \"Hardware safety notes\".",
+            "Move the head: yaw -90..90, pitch clamped to the safe range; optional speed_dps.",
             // Pitch schema range is intentionally permissive across the
             // entire `int` value range (std::numeric_limits<int>::min/max):
             // the authoritative Tier 1 enforcement lives in the handler
@@ -6135,7 +7884,7 @@ private:
 
         mcp_server.AddTool(
             "self.wifi.set_power_save",
-            "Set the ESP32 WiFi power-save mode at runtime. Mode \"none\" disables modem sleep so high-rate command streams (for example, the pose-stream follower) avoid the ~800 ms TCP send jitter caused by the DTIM beacon cycle, at the cost of higher idle WiFi power consumption. Mode \"min_modem\" restores the xiaozhi-esp32 default light modem sleep for normal interactive use. Returns {ok, previous, current}.",
+            "Set the ESP32 WiFi power-save mode at runtime.",
             PropertyList({Property("mode", kPropertyTypeString)}),
             [](const PropertyList& properties) -> ReturnValue {
                 std::string mode_str = properties["mode"].value<std::string>();
@@ -6187,11 +7936,7 @@ private:
         // Get current head angles
         mcp_server.AddTool(
             "self.robot.get_head_angles",
-            "Get the current head angles (yaw, pitch) of the robot in degrees. "
-            "Returns {\"yaw\":N,\"pitch\":N} on success; "
-            "on persistent ReadPos failure returns "
-            "{\"yaw\":null,\"pitch\":null,\"error\":...,\"servo_ok\":bool,"
-            "\"yaw_attempts\":N,\"pitch_attempts\":N}.",
+            "Get the current head angles (yaw, pitch) of the robot in degrees.",
             PropertyList(),
             [this](const PropertyList& properties) -> ReturnValue {
                 // Issue #123: retry ReadPos a few times before falling back
@@ -6270,18 +8015,7 @@ private:
 
         mcp_server.AddTool(
             "self.robot.set_servo_torque",
-            "Enable or disable SCS0009 servo torque on the yaw / pitch axes "
-            "independently. Disabling torque stops motor current on that axis; "
-            "the head holds via static friction (no motion is commanded). "
-            "On disable, the corresponding axis's MotionDriver state is reset "
-            "(moving=false, position_unknown=true, request token invalidated) "
-            "so a stale interpolation cannot resume on the bus and a "
-            "subsequent same-target set_head_angles is re-dispatched rather "
-            "than no-op-optimized. Re-enabling torque does NOT trigger a "
-            "move -- the next set_head_angles or wobble call will. Returns "
-            "the per-axis bus return codes. Diagnostic / power-management "
-            "primitive; auto release on idle is tracked separately under "
-            "#152 Phase 4.",
+            "Enable or disable SCS0009 servo torque on the yaw / pitch axes...",
             PropertyList({Property("yaw_enabled", kPropertyTypeBoolean),
                           Property("pitch_enabled", kPropertyTypeBoolean)}),
             [this](const PropertyList& properties) -> ReturnValue {
@@ -6323,12 +8057,7 @@ private:
 
         mcp_server.AddTool(
             "self.robot.set_auto_torque_release",
-            "Enable or disable automatic SCS0009 torque release after "
-            "motion idle timeout. timeout_ms is clamped by the firmware "
-            "to 500..600000 ms. Disabling this setting does not re-enable "
-            "torque if it is already released; the next set_head_angles, "
-            "wobble, or explicit set_servo_torque(true, true) call "
-            "re-engages torque.",
+            "Enable or disable automatic SCS0009 torque release after motion idle...",
             PropertyList({Property("enabled", kPropertyTypeBoolean),
                           Property("timeout_ms", kPropertyTypeInteger,
                                    (int)AUTO_TORQUE_RELEASE_DEFAULT_MS)}),
@@ -6385,10 +8114,11 @@ private:
                 return root;
             });
 
+#if CONFIG_STACKCHAN_DIAGNOSTIC_TOOLS
         // Diagnostic: toggle GPIO6 (servo TX) HIGH/LOW to verify physical signal
         mcp_server.AddTool(
             "self.robot.gpio_test",
-            "Diagnostic: toggle GPIO6 (servo TX pin) HIGH/LOW 5 times at 100ms intervals to verify physical signal output. Restores UART pins after.",
+            "Diagnostic: toggle GPIO6 (servo TX pin) HIGH/LOW 5 times at 100ms...",
             PropertyList(),
             [](const PropertyList& properties) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -6429,7 +8159,7 @@ private:
         // Diagnostic: send raw bytes via uart_write_bytes, equivalent to WritePos(1, 1000, 0, 0)
         mcp_server.AddTool(
             "self.robot.uart_diag",
-            "Diagnostic: send raw 8 bytes (FF FF 01 04 03 E8 00 00) directly via uart_write_bytes. Returns sent byte count and rx buffer length before/after.",
+            "Diagnostic: send raw 8 bytes (FF FF 01 04 03 E8 00 00) directly via...",
             PropertyList(),
             [this](const PropertyList& properties) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -6483,8 +8213,7 @@ private:
         // load, the servo loses power even though the I2C write succeeds.
         mcp_server.AddTool(
             "self.robot.check_vm_en",
-            "Diagnostic: read PY32 REG_GPIO_O_L and report whether VM EN (pin 0 = servo power) is currently HIGH. "
-            "Returns {io_expander_present, i2c_read_ok, raw, vm_en_high}.",
+            "Diagnostic: read PY32 REG_GPIO_O_L and report whether VM EN (pin 0 =...",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -6503,6 +8232,8 @@ private:
                 return root;
             });
 
+#endif  // CONFIG_STACKCHAN_DIAGNOSTIC_TOOLS
+
         // Set the avatar face (one of: idle, happy, thinking, sad, surprised,
         // embarrassed, off).
         // The image is rendered as a 320x240 overlay on top of the chat UI's
@@ -6514,12 +8245,7 @@ private:
         // restores blink to whatever state it was in before going off.
         mcp_server.AddTool(
             "self.display.set_avatar",
-            "Set the avatar face displayed on the LCD. face must be one of: "
-            "idle, happy, thinking, sad, surprised, embarrassed, off. "
-            "'off' hides the avatar and disables blink so the underlying "
-            "xiaozhi-esp32 screens (WiFi config UI, OTA, settings) are "
-            "visible; calling set_avatar with another face brings the avatar "
-            "back and restores the previous blink state.",
+            "Set the face (an expression name, or off to show the system UI).",
             PropertyList({Property("face", kPropertyTypeString)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 std::string face = properties["face"].value<std::string>();
@@ -6540,8 +8266,7 @@ private:
                 } else {
                     cJSON_AddBoolToObject(root, "ok", false);
                     cJSON_AddStringToObject(root, "error",
-                        "Unknown face. Allowed: idle, happy, thinking, sad, "
-                        "surprised, embarrassed, off.");
+                        "Unknown face. Allowed: " STACKCHAN_FACE_NAMES ", off.");
                     ESP_LOGW(TAG, "set_avatar rejected: unknown face '%s'", face.c_str());
                     return root;
                 }
@@ -6559,9 +8284,7 @@ private:
         // callers should drive it from their TTS / audio level loop.
         mcp_server.AddTool(
             "self.display.set_mouth",
-            "Set the avatar mouth shape. mouth must be one of: "
-            "closed, half, open, e, u. Held until the next set_avatar/set_mouth, "
-            "or until a blink restores the resting face.",
+            "Set the avatar mouth shape.",
             PropertyList({Property("mouth", kPropertyTypeString)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 std::string mouth = properties["mouth"].value<std::string>();
@@ -6601,20 +8324,7 @@ private:
         // replacement, final shape held).
         mcp_server.AddTool(
             "self.display.set_mouth_sequence",
-            "Queue a lip-sync sequence and play it locally. steps_json must "
-            "decode to a JSON array of {shape, duration_ms} objects (1..256 "
-            "items, shape in {closed, half, open, e, u}, duration_ms in "
-            "10..10000). Returns immediately; calling set_mouth, set_avatar, "
-            "or this tool again interrupts the in-flight sequence. "
-            "Autonomous blink is paused while a sequence plays and resumed "
-            "when it ends (resume reads the user's most recent set_blink "
-            "intent, not a snapshot). The final shape is held until the "
-            "next set_mouth / set_avatar call, or until the next autonomous "
-            "blink restores the resting face — the same Phase 2 trade-off "
-            "that applies to set_mouth, since blink ends by repainting the "
-            "full face. If the final shape must persist visually, disable "
-            "blink with set_blink(false) before the sequence (or append a "
-            "closed step if you just want the mouth to close at the end).",
+            "Queue a lip-sync sequence and play it locally.",
             PropertyList({Property("steps_json", kPropertyTypeString)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 std::string steps_json = properties["steps_json"].value<std::string>();
@@ -6642,12 +8352,7 @@ private:
         // sequence finishes.
         mcp_server.AddTool(
             "self.display.set_blink",
-            "Enable or disable autonomous eye blinking on the avatar. "
-            "When enabled, a brief blink animation runs every 3-6 seconds. "
-            "If a set_mouth_sequence is currently playing, blink is paused "
-            "until the sequence ends; this call still records the intent "
-            "and is applied at the sequence end (or immediately if no "
-            "sequence is running).",
+            "Enable or disable autonomous eye blinking on the avatar.",
             PropertyList({Property("enabled", kPropertyTypeBoolean)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 bool enabled = properties["enabled"].value<bool>();
@@ -6688,8 +8393,7 @@ private:
         // to notice TAP/STROKE on the head without holding open a stream.
         mcp_server.AddTool(
             "self.touch.get_touch_state",
-            "Get the current head-touch sensor state and last gesture event "
-            "(tap/stroke/idle) with its age in milliseconds.",
+            "Get the current head-touch sensor state and last gesture event...",
             PropertyList(),
             [this](const PropertyList& properties) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -6723,8 +8427,7 @@ private:
         // four tools refresh implicitly so the LLM gets WYSIWYG behaviour.
         mcp_server.AddTool(
             "self.led.set_color",
-            "Set a single RGB LED on the StackChan base. There are 12 LEDs "
-            "(index 0..11). r/g/b are 0..255. Updates immediately.",
+            "Set a single RGB LED on the StackChan base.",
             PropertyList({
                 Property("index", kPropertyTypeInteger, 0, RGB_LED_COUNT - 1),
                 Property("r", kPropertyTypeInteger, 0, 255),
@@ -6752,8 +8455,7 @@ private:
 
         mcp_server.AddTool(
             "self.led.set_all",
-            "Set all 12 RGB LEDs on the StackChan base to the same color. "
-            "r/g/b are 0..255. Updates immediately.",
+            "Set all 12 RGB LEDs on the StackChan base to the same color.",
             PropertyList({
                 Property("r", kPropertyTypeInteger, 0, 255),
                 Property("g", kPropertyTypeInteger, 0, 255),
@@ -6789,11 +8491,7 @@ private:
         // entries are left at their previous color (PY32 RAM is sticky).
         mcp_server.AddTool(
             "self.led.set_many",
-            "Set multiple RGB LEDs in one shot. 'colors' is a JSON-encoded "
-            "array of [r,g,b] triples starting at index 0, e.g. "
-            "\"[[255,0,0],[0,255,0],[0,0,255]]\". Up to 12 entries; extras "
-            "are ignored, missing entries keep their previous color. "
-            "r/g/b are 0..255. Updates immediately.",
+            "Set multiple RGB LEDs in one shot.",
             PropertyList({Property("colors", kPropertyTypeString)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -6866,7 +8564,7 @@ private:
 
         mcp_server.AddTool(
             "self.led.clear",
-            "Turn off all 12 RGB LEDs on the StackChan base. Updates immediately.",
+            "Turn off all 12 RGB LEDs on the StackChan base.",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -6893,13 +8591,7 @@ private:
 
         mcp_server.AddTool(
             "self.i2c.scan",
-            "Scan the external I2C bus on Grove Port A and return all 7-bit "
-            "addresses (probe range 0x08..0x77, excluding I2C reserved "
-            "ranges) that ACK a probe. Use this to discover attached "
-            "M5Stack Unit modules (ENV III, ToF, gas sensor, PaHub, etc.). "
-            "On-board ICs on the internal bus are NOT included (this tool "
-            "operates on a physically separate bus). Returns "
-            "{\"ok\":true, \"addresses\":[...]}.",
+            "Scan the external I2C bus on Grove Port A and return all 7-bit...",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -6923,19 +8615,7 @@ private:
 
         mcp_server.AddTool(
             "self.i2c.read",
-            "Read n_bytes from an I2C device at 7-bit address `addr` on Grove "
-            "Port A. `addr` is restricted to 0x08..0x77 (I2C reserved ranges "
-            "excluded — matches the self.i2c.scan probe range). Use this for "
-            "protocols that read the device's current register / output "
-            "without a preceding write (e.g. sensors that latch a measurement "
-            "from a prior command). For typical 'write register address, "
-            "then read' patterns, use self.i2c.write_read instead. Returns "
-            "{\"ok\":true, \"bytes\":[...]} or "
-            "{\"ok\":false, \"error\":\"ESP_ERR_TIMEOUT\"} on NACK. Optional "
-            "`scl_speed_hz` (default 400000) sets the I2C clock for this "
-            "transaction; lower it (e.g. 200000) for slower Units such as the "
-            "RCWL-9620 ultrasonic ranger that fail at 400 kHz with "
-            "ESP_ERR_INVALID_STATE.",
+            "Read n_bytes from an I2C device at 7-bit address `addr` on Grove Port A.",
             PropertyList({
                 Property("addr", kPropertyTypeInteger, 0x08, 0x77),
                 Property("n_bytes", kPropertyTypeInteger, 1, 256),
@@ -6987,19 +8667,7 @@ private:
         i2c_write_bytes_prop.set_max_items(256);  // 対称: n_bytes の read 上限と同じ
         mcp_server.AddTool(
             "self.i2c.write",
-            "Write bytes to an I2C device at 7-bit address `addr` on Grove "
-            "Port A. `addr` is restricted to 0x08..0x77 (I2C reserved ranges "
-            "excluded — General-call address 0x00 etc. cannot accidentally "
-            "broadcast-write to all attached Units). `bytes` is an array of "
-            "integers (0..255, max 256 items). This tool operates on the "
-            "external Port A bus only; on-board ICs (PMIC, AW9523, touch, "
-            "etc.) on the internal bus are not reachable. Returns "
-            "{\"ok\":true} on ACK or "
-            "{\"ok\":false, \"error\":\"ESP_ERR_TIMEOUT\"} on NACK. Optional "
-            "`scl_speed_hz` (default 400000) sets the I2C clock for this "
-            "transaction; lower it (e.g. 200000) for slower Units such as the "
-            "RCWL-9620 ultrasonic ranger that fail at 400 kHz with "
-            "ESP_ERR_INVALID_STATE.",
+            "Write bytes to an I2C device at 7-bit address `addr` on Grove Port A.",
             PropertyList({
                 Property("addr", kPropertyTypeInteger, 0x08, 0x77),
                 i2c_write_bytes_prop,
@@ -7049,19 +8717,7 @@ private:
         i2c_wr_write_bytes_prop.set_max_items(256);  // 対称: n_bytes の read 上限と同じ
         mcp_server.AddTool(
             "self.i2c.write_read",
-            "Write `write_bytes` to an I2C device at 7-bit address `addr` on "
-            "Grove Port A, then read n_bytes back in a single transaction "
-            "(Repeated Start). `addr` is restricted to 0x08..0x77 (I2C "
-            "reserved ranges excluded). `write_bytes` is an array of "
-            "integers (0..255, max 256 items). This is the common 'set "
-            "register pointer, then read' pattern: pass write_bytes=[reg_addr] "
-            "to read from a specific register. Returns "
-            "{\"ok\":true, \"bytes\":[...]} or "
-            "{\"ok\":false, \"error\":\"...\"} on failure. Optional "
-            "`scl_speed_hz` (default 400000) sets the I2C clock for this "
-            "transaction; lower it (e.g. 200000) for slower Units such as the "
-            "RCWL-9620 ultrasonic ranger that fail at 400 kHz with "
-            "ESP_ERR_INVALID_STATE.",
+            "Write `write_bytes` to an I2C device at 7-bit address `addr` on...",
             PropertyList({
                 Property("addr", kPropertyTypeInteger, 0x08, 0x77),
                 i2c_wr_write_bytes_prop,
@@ -7123,19 +8779,7 @@ private:
 
         mcp_server.AddTool(
             "self.port_b.ws2812.init",
-            "Initialize a WS2812-compatible LED strip connected to Port B "
-            "(CoreS3 HY2.0-4P digital OUTPUT, GPIO 9). led_count is the "
-            "number of LEDs in the strip (1..256). This allocates the "
-            "ESP-IDF led_strip RMT backend and must succeed before calling "
-            "self.port_b.ws2812.set_pixel, set_strip, refresh, or clear. "
-            "Repeated calls with the same led_count are no-ops; a different "
-            "led_count tears down and rebuilds the strip handle. Returns "
-            "{\"available\":true,\"ok\":true,\"led_count\":N} on success or "
-            "{\"available\":false,\"ok\":false,\"led_count\":N,"
-            "\"error\":\"ESP_ERR_...\"} on failure. The strip protocol is "
-            "3.3 V CMOS data on GPIO 9; most modern WS2812B-V5/B2 strips "
-            "tolerate this, while older strict 5 V V_IH variants may need "
-            "an external level shifter.",
+            "Initialize a WS2812-compatible LED strip connected to Port B (CoreS3...",
             PropertyList({
                 Property("led_count", kPropertyTypeInteger, 1, PORT_B_WS2812_MAX_LEDS)
             }),
@@ -7157,17 +8801,7 @@ private:
 
         mcp_server.AddTool(
             "self.port_b.ws2812.set_pixel",
-            "Set one LED in the Port B WS2812 strip buffer. Call "
-            "self.port_b.ws2812.init first; until init succeeds this returns "
-            "{\"available\":false,\"ok\":false}. index is 0..255, but the "
-            "effective range is 0..(led_count-1); out-of-range requests "
-            "return ok=false with error=\"index out of range\". r, g, and b "
-            "are 0..255. By default the color is buffered only; pass "
-            "refresh=true to immediately latch it to the strip, or call "
-            "self.port_b.ws2812.refresh after several buffered updates. "
-            "Runtime led_strip failures return ok=false with error. Port B "
-            "outputs 3.3 V CMOS data on GPIO 9; older strict 5 V WS2812 "
-            "variants may require a level shifter.",
+            "Set one LED in the Port B WS2812 strip buffer.",
             PropertyList({
                 Property("index", kPropertyTypeInteger, 0, PORT_B_WS2812_MAX_LEDS - 1),
                 Property("r", kPropertyTypeInteger, 0, 255),
@@ -7212,19 +8846,7 @@ private:
 
         mcp_server.AddTool(
             "self.port_b.ws2812.set_strip",
-            "Set multiple LEDs in the Port B WS2812 strip and refresh "
-            "immediately. Call self.port_b.ws2812.init first; until init "
-            "succeeds this returns {\"available\":false,\"ok\":false}. "
-            "colors is a JSON-encoded array of [r,g,b] integer triples, "
-            "for example \"[[255,0,0],[0,255,0],[0,0,255]]\". Entries are "
-            "applied from LED index 0; up to led_count entries are written, "
-            "extras are ignored, and missing trailing entries preserve the "
-            "previous buffered values. The payload is validate-then-write: "
-            "a malformed entry leaves the strip buffer unchanged. This tool "
-            "auto-refreshes and is the preferred path for animation frames. "
-            "Runtime led_strip failures return ok=false with error. Port B "
-            "outputs 3.3 V CMOS data on GPIO 9; older strict 5 V WS2812 "
-            "variants may require a level shifter.",
+            "Set multiple LEDs in the Port B WS2812 strip and refresh immediately.",
             PropertyList({Property("colors", kPropertyTypeString)}),
             [this](const PropertyList& props) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -7309,14 +8931,7 @@ private:
 
         mcp_server.AddTool(
             "self.port_b.ws2812.refresh",
-            "Refresh the Port B WS2812 strip, latching the current buffered "
-            "colors out on CoreS3 HY2.0-4P digital OUTPUT GPIO 9. Call "
-            "self.port_b.ws2812.init first; until init succeeds this returns "
-            "{\"available\":false,\"ok\":false}. Use this after one or more "
-            "self.port_b.ws2812.set_pixel calls made with refresh=false. "
-            "Runtime led_strip failures return ok=false with error. Port B "
-            "outputs 3.3 V CMOS data; older strict 5 V WS2812 variants may "
-            "require a level shifter.",
+            "Refresh the Port B WS2812 strip, latching the current buffered...",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -7339,15 +8954,7 @@ private:
 
         mcp_server.AddTool(
             "self.port_b.ws2812.clear",
-            "Turn off every LED in the Port B WS2812 strip and refresh "
-            "immediately on CoreS3 HY2.0-4P digital OUTPUT GPIO 9. Call "
-            "self.port_b.ws2812.init first; until init succeeds this returns "
-            "{\"available\":false,\"ok\":false}. This is equivalent to "
-            "self.port_b.ws2812.set_strip with an all-zero array of length "
-            "led_count, and it clears the driver's sticky per-pixel buffer. "
-            "Runtime led_strip failures return ok=false with error. Port B "
-            "outputs 3.3 V CMOS data; older strict 5 V WS2812 variants may "
-            "require a level shifter.",
+            "Turn off every LED in the Port B WS2812 strip and refresh...",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -7375,19 +8982,7 @@ private:
 
         mcp_server.AddTool(
             "self.port_c.ws2812.init",
-            "Initialize a WS2812-compatible LED strip connected to Port C "
-            "(CoreS3 HY2.0-4P signal 1, GPIO 17). led_count is the "
-            "number of LEDs in the strip (1..256). This allocates the "
-            "ESP-IDF led_strip RMT backend and must succeed before calling "
-            "self.port_c.ws2812.set_pixel, set_strip, refresh, or clear. "
-            "Repeated calls with the same led_count are no-ops; a different "
-            "led_count tears down and rebuilds the strip handle. Returns "
-            "{\"available\":true,\"ok\":true,\"led_count\":N} on success or "
-            "{\"available\":false,\"ok\":false,\"led_count\":N,"
-            "\"error\":\"ESP_ERR_...\"} on failure. The strip protocol is "
-            "3.3 V CMOS data on GPIO 17; most modern WS2812B-V5/B2 strips "
-            "tolerate this, while older strict 5 V V_IH variants may need "
-            "an external level shifter.",
+            "Initialize a WS2812-compatible LED strip connected to Port C (CoreS3...",
             PropertyList({
                 Property("led_count", kPropertyTypeInteger, 1, PORT_C_WS2812_MAX_LEDS)
             }),
@@ -7409,17 +9004,7 @@ private:
 
         mcp_server.AddTool(
             "self.port_c.ws2812.set_pixel",
-            "Set one LED in the Port C WS2812 strip buffer. Call "
-            "self.port_c.ws2812.init first; until init succeeds this returns "
-            "{\"available\":false,\"ok\":false}. index is 0..255, but the "
-            "effective range is 0..(led_count-1); out-of-range requests "
-            "return ok=false with error=\"index out of range\". r, g, and b "
-            "are 0..255. By default the color is buffered only; pass "
-            "refresh=true to immediately latch it to the strip, or call "
-            "self.port_c.ws2812.refresh after several buffered updates. "
-            "Runtime led_strip failures return ok=false with error. Port C "
-            "outputs 3.3 V CMOS data on GPIO 17; older strict 5 V WS2812 "
-            "variants may require a level shifter.",
+            "Set one LED in the Port C WS2812 strip buffer.",
             PropertyList({
                 Property("index", kPropertyTypeInteger, 0, PORT_C_WS2812_MAX_LEDS - 1),
                 Property("r", kPropertyTypeInteger, 0, 255),
@@ -7464,19 +9049,7 @@ private:
 
         mcp_server.AddTool(
             "self.port_c.ws2812.set_strip",
-            "Set multiple LEDs in the Port C WS2812 strip and refresh "
-            "immediately. Call self.port_c.ws2812.init first; until init "
-            "succeeds this returns {\"available\":false,\"ok\":false}. "
-            "colors is a JSON-encoded array of [r,g,b] integer triples, "
-            "for example \"[[255,0,0],[0,255,0],[0,0,255]]\". Entries are "
-            "applied from LED index 0; up to led_count entries are written, "
-            "extras are ignored, and missing trailing entries preserve the "
-            "previous buffered values. The payload is validate-then-write: "
-            "a malformed entry leaves the strip buffer unchanged. This tool "
-            "auto-refreshes and is the preferred path for animation frames. "
-            "Runtime led_strip failures return ok=false with error. Port C "
-            "outputs 3.3 V CMOS data on GPIO 17; older strict 5 V WS2812 "
-            "variants may require a level shifter.",
+            "Set multiple LEDs in the Port C WS2812 strip and refresh immediately.",
             PropertyList({Property("colors", kPropertyTypeString)}),
             [this](const PropertyList& props) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -7561,14 +9134,7 @@ private:
 
         mcp_server.AddTool(
             "self.port_c.ws2812.refresh",
-            "Refresh the Port C WS2812 strip, latching the current buffered "
-            "colors out on CoreS3 HY2.0-4P signal 1 GPIO 17. Call "
-            "self.port_c.ws2812.init first; until init succeeds this returns "
-            "{\"available\":false,\"ok\":false}. Use this after one or more "
-            "self.port_c.ws2812.set_pixel calls made with refresh=false. "
-            "Runtime led_strip failures return ok=false with error. Port C "
-            "outputs 3.3 V CMOS data; older strict 5 V WS2812 variants may "
-            "require a level shifter.",
+            "Refresh the Port C WS2812 strip, latching the current buffered...",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -7591,15 +9157,7 @@ private:
 
         mcp_server.AddTool(
             "self.port_c.ws2812.clear",
-            "Turn off every LED in the Port C WS2812 strip and refresh "
-            "immediately on CoreS3 HY2.0-4P signal 1 GPIO 17. Call "
-            "self.port_c.ws2812.init first; until init succeeds this returns "
-            "{\"available\":false,\"ok\":false}. This is equivalent to "
-            "self.port_c.ws2812.set_strip with an all-zero array of length "
-            "led_count, and it clears the driver's sticky per-pixel buffer. "
-            "Runtime led_strip failures return ok=false with error. Port C "
-            "outputs 3.3 V CMOS data; older strict 5 V WS2812 variants may "
-            "require a level shifter.",
+            "Turn off every LED in the Port C WS2812 strip and refresh...",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -7622,20 +9180,7 @@ private:
 
         mcp_server.AddTool(
             "self.power.set_charge_enabled",
-            "Enable or disable AXP2101 cell battery charging (register "
-            "0x18 bit1, Read-Modify-Write; the fuel gauge enable bit and "
-            "every other bit are preserved). Takes effect immediately "
-            "over I2C and is read back from the PMIC before returning. "
-            "When automatic charge control is enabled, this manual setting "
-            "is temporary and may be overwritten by the startup decision "
-            "or the next approximately 60-second automatic decision. When "
-            "automatic control is disabled at build time, the setting is "
-            "still not persisted to NVS and the compile-time boot default "
-            "(STACKCHAN_DEFAULT_CHARGE_ENABLED) applies on reboot. "
-            "Disabling charging only stops "
-            "current flowing into the cell; it does not cut USB power to "
-            "the system (VBUS keeps powering VSYS through a separate "
-            "path per the AXP2101 datasheet).",
+            "Enable or disable AXP2101 cell battery charging (register 0x18 bit1...",
             PropertyList({Property("enabled", kPropertyTypeBoolean)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 bool enabled = properties["enabled"].value<bool>();
@@ -7665,21 +9210,7 @@ private:
 
         mcp_server.AddTool(
             "self.power.get_charge_state",
-            "Read the current AXP2101 charge-control state. charge_enabled "
-            "and reg_0x18 are a fresh Read of register 0x18 (bit1 = cell "
-            "battery charge enable). charging, discharging, and "
-            "charge_done come from the existing Axp2101 accessors (register "
-            "0x01). battery_level is the fuel-gauge percentage from "
-            "register 0xA4. The response also reports whether automatic "
-            "control is enabled, its inclusive ON/OFF thresholds, and the "
-            "last automatic decision (including threshold-band hold and "
-            "battery-read-failure fail-safe results). Manual charge changes may "
-            "be overwritten by a later automatic decision while auto is "
-            "enabled. Battery voltage/current are intentionally not "
-            "reported because this implementation does not have confirmed "
-            "AXP2101 live-voltage/current ADC readback registers or a "
-            "conversion formula, and this tool intentionally does not add "
-            "a driver for the separate INA226 monitor.",
+            "Read the current AXP2101 charge-control state.",
             PropertyList(),
             [this](const PropertyList&) -> ReturnValue {
                 cJSON* root = cJSON_CreateObject();
@@ -7745,12 +9276,26 @@ public:
         InitializeServo();
         InitializeTouchSettings();
         InitializeSi12tTouch();
+#if CONFIG_STACKCHAN_BODY_SENSORS
+        InitializeBodySensors();
+#endif
         I2cDetect();
         // Avatar auto-display disabled: WiFi config UI needs to be visible.
         // Avatar is shown on-demand via MCP set_avatar command.
         // InitializeAvatar();
         InitializeMouthSequenceTask();
         RegisterMcpTools();
+        // These used to hang off InitializeAvatar(), which this board no
+        // longer calls (the avatar appears on the first set_avatar).
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+        StartProceduralFaceAnimation();
+#endif
+#if CONFIG_STACKCHAN_PROCEDURAL_FACE
+        LoadFaceStyle();
+#endif
+        StartStatusIcons();
+        StartClockTimer();
+        StartLcdRefresh();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
