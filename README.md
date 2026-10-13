@@ -57,11 +57,13 @@ This repository is a monorepo.
 | `get_touch_state` | Touch sensor state (press / release / stroke / etc.) | ✅ |
 | `get_touch_sensor_enabled` | Read whether head-touch detection is enabled. The NVS-backed setting persists across reboot. | ✅ |
 | `set_touch_sensor_enabled(enabled)` | Enable or disable head-touch detection. Disabling stops both the firmware local motion response and MCP `stackchan/event` emission, and persists across reboot. | ✅ |
+| `get_motion` | IMU (BMI270) reading: acceleration (g), rotation (deg/s) and whether the robot is being held. Being picked up / put down / tipped over / shaken also arrives as an `imu` event. Requires `CONFIG_STACKCHAN_BODY_SENSORS` (default on) | ✅ |
+| `get_proximity` | Proximity sensor (LTR-553) reading: raw proximity (0-2047, bigger = closer) and whether something is near. Someone approaching / leaving also arrives as a `proximity` event | ✅ |
 | `set_avatar(face)` | Switch avatar expression (`idle` / `happy` / `thinking` / `sad` / `surprised` / `embarrassed`), or `off` to hide the avatar and disable blink so the underlying WiFi config / OTA / settings screens are visible. Any other face brings the avatar back and restores blink. | ✅ |
 | `set_blink(state)` | Blink on/off | ✅ |
 | `set_mouth(state)` | Mouth open/close (one-shot, held until next call) | ✅ |
 | `set_mouth_sequence(steps)` | Queue and play a list of `{shape, duration_ms}` steps locally for TTS lip-sync — no per-step WebSocket RTT jitter | ✅ |
-| `check_vm_en` | Check servo power supply (VM EN HIGH) state | ✅ |
+| `check_vm_en` | Check servo power supply (VM EN HIGH) state. Only in firmware built with `CONFIG_STACKCHAN_DIAGNOSTIC_TOOLS=y` | ✅ |
 | `set_led(index, r, g, b)` | Set one of the 12 base RGB LEDs (index `0..11`, channels `0..255`) | ✅ |
 | `set_all_leds(r, g, b)` | Set all 12 base RGB LEDs to the same color | ✅ |
 | `set_leds(colors)` | Batch-set the first N LEDs from a `[[r,g,b], ...]` array in a single I2C burst (use this for animations / multi-color patterns); trailing LEDs keep their previous color | ✅ |
