@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "stackchan": {
+      "command": "uv",
+      "args": ["run", "--directory", "../gateway", "stackchan-mcp", "channel"]
+    }
+  }
+}

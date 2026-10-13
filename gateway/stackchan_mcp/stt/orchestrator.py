@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -88,8 +89,6 @@ def _is_beat_mode_owner(owner: str | None) -> bool:
     )
 
 
-MIN_LOOK_UP_PITCH = 5.0
-MAX_LOOK_UP_PITCH = 85.0
 
 
 def _validate_motion_args(
@@ -107,14 +106,16 @@ def _validate_motion_args(
         look_up_pitch_raw, int | float
     ):
         raise ValueError(
-            "'look_up_pitch' must be a number between 5 and 85; got "
+            "'look_up_pitch' must be a number; got "
             + repr(look_up_pitch_raw)
         )
 
     look_up_pitch = float(look_up_pitch_raw)
-    if look_up_pitch < MIN_LOOK_UP_PITCH or look_up_pitch > MAX_LOOK_UP_PITCH:
+    from ..head_limits import pitch_max, pitch_min
+
+    if look_up_pitch < pitch_min() or look_up_pitch > pitch_max():
         raise ValueError(
-            "'look_up_pitch' must be between 5 and 85; got "
+            f"'look_up_pitch' must be between {pitch_min()} and {pitch_max()}; got "
             f"{look_up_pitch_raw!r}"
         )
 
@@ -297,7 +298,7 @@ async def listen_and_transcribe(
     Args:
         arguments: MCP tool arguments. Recognised keys:
 
-            * ``duration_ms`` (optional, default 5000): capture window
+            * ``duration_ms`` (optional, default 3000): capture window
               in milliseconds, clamped to
               [:data:`MIN_DURATION_MS`, :data:`MAX_DURATION_MS`].
             * ``engine``: engine name; defaults to
@@ -327,7 +328,7 @@ async def listen_and_transcribe(
         RuntimeError: no gateway / no device / wrong protocol /
             device disconnected mid-capture.
     """
-    duration_raw = arguments.get("duration_ms", 5000)
+    duration_raw = arguments.get("duration_ms", 3000)
     if isinstance(duration_raw, bool) or not isinstance(duration_raw, int):
         raise ValueError(
             "'duration_ms' must be an integer; got " + repr(duration_raw)
@@ -400,7 +401,9 @@ async def listen_and_transcribe(
         )
 
     duration_ms = int(duration_raw)
-    language = arguments.get("language", "ja")
+    # STACKCHAN_STT_LANGUAGE lets English-speaking setups avoid passing
+    # language on every listen() call; "ja" stays the upstream default.
+    language = arguments.get("language", os.getenv("STACKCHAN_STT_LANGUAGE") or "ja")
     model = arguments.get("model")
 
     frame_count = 0

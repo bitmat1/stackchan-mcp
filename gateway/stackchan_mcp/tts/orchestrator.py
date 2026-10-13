@@ -21,7 +21,7 @@ import json
 import logging
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from typing import TYPE_CHECKING, Any
 
 from .audio_utils import (
@@ -44,6 +44,46 @@ if TYPE_CHECKING:
 #: ``OnIncomingAudio``. 50 ms is well above typical scheduling latency
 #: but well below human-perceptible delay.
 TTS_START_TRANSITION_DELAY_S = 0.05
+
+#: Audio sent ahead of real time at the start of an utterance, so a Wi-Fi
+#: hiccup mid-sentence drains this cushion instead of the device's decode
+#: queue running dry (heard as a pause). The firmware queue holds ~2.4 s
+#: (MAX_DECODE_PACKETS_IN_QUEUE), so keep this well below that.
+TTS_PREBUFFER_ENV_VAR = "STACKCHAN_TTS_PREBUFFER_MS"
+DEFAULT_TTS_PREBUFFER_MS = 600
+MAX_TTS_PREBUFFER_MS = 1800
+
+#: Keep the device's Wi-Fi out of modem power save while it speaks, so
+#: frames are not held back until the next beacon wake-up.
+TTS_WIFI_AWAKE_ENV_VAR = "STACKCHAN_TTS_WIFI_AWAKE"
+
+
+@asynccontextmanager
+async def _wifi_awake_lease(gateway: Any) -> AsyncIterator[None]:
+    """Hold the device's Wi-Fi out of power save for one utterance."""
+    if not _wifi_awake_enabled() or not hasattr(gateway.esp32, "call_tool"):
+        yield
+        return
+    from ..wifi_power_save import acquire_wifi_power_save, release_wifi_power_save
+
+    await acquire_wifi_power_save(gateway.esp32)
+    try:
+        yield
+    finally:
+        await release_wifi_power_save(gateway.esp32)
+
+
+def _prebuffer_s() -> float:
+    raw = os.getenv(TTS_PREBUFFER_ENV_VAR, "").strip()
+    try:
+        ms = int(raw) if raw else DEFAULT_TTS_PREBUFFER_MS
+    except ValueError:
+        ms = DEFAULT_TTS_PREBUFFER_MS
+    return max(0, min(ms, MAX_TTS_PREBUFFER_MS)) / 1000.0
+
+
+def _wifi_awake_enabled() -> bool:
+    return os.getenv(TTS_WIFI_AWAKE_ENV_VAR, "1").strip().lower() not in {"0", "false", "no", "off"}
 
 #: Delay after the ``tts.stop`` notification before reasserting an
 #: emoji-selected face. Firmware handles stop by scheduling the idle /
@@ -361,19 +401,29 @@ async def synthesize_and_send(
     # Hand the PCM off to the shared encode-and-push path. Engines that
     # have already resampled to DEVICE_SAMPLE_RATE (the documented
     # TTSEngine contract) need no further conversion here.
-    result = await send_pcm_audio(
-        gateway,
-        pcm,
-        source_label=f"engine:{voice}",
-        before_first_frame=(
-            dispatch_face_before_first_frame if face is not None else None
-        ),
-        after_playback_complete=(
-            redispatch_face_after_playback
-            if should_redispatch_face_after_speech
-            else None
-        ),
-    )
+    from ..subtitles import show_subtitle, subtitles_enabled
+
+    subtitle = strip_emoji_for_plain_tts(text).strip() if subtitles_enabled() else ""
+    if subtitle:
+        # 16 kHz mono s16 PCM = 32 bytes per millisecond.
+        await show_subtitle(gateway.esp32, subtitle, len(pcm) // 32)
+    try:
+        result = await send_pcm_audio(
+            gateway,
+            pcm,
+            source_label=f"engine:{voice}",
+            before_first_frame=(
+                dispatch_face_before_first_frame if face is not None else None
+            ),
+            after_playback_complete=(
+                redispatch_face_after_playback
+                if should_redispatch_face_after_speech
+                else None
+            ),
+        )
+    finally:
+        if subtitle:
+            await show_subtitle(gateway.esp32, "", 0)
 
     logger.info(
         "say(): engine=%s speaker=%s frames=%d duration_ms=%d",
@@ -528,7 +578,7 @@ async def send_pcm_audio(
 
     sent = 0
     push_error: ConnectionError | None = None
-    async with lock_ctx:
+    async with _wifi_awake_lease(gateway), lock_ctx:
         try:
             await gateway.esp32.send_tts_state("start")
         except ConnectionError as exc:
@@ -556,7 +606,9 @@ async def send_pcm_audio(
             if before_first_frame is not None:
                 await before_first_frame()
 
-            next_send_time = loop.time()
+            # Front-load the prebuffer: frames scheduled before "now" go
+            # out back-to-back, then pacing settles to real time.
+            next_send_time = loop.time() - _prebuffer_s()
             for frame in opus_frames:
                 now = loop.time()
                 if now < next_send_time:
@@ -773,7 +825,7 @@ async def send_pcm_stream(
 
         frame_period_s = DEVICE_FRAME_DURATION_MS / 1000.0
         loop = asyncio.get_event_loop()
-        next_send_time = loop.time()
+        next_send_time = loop.time() - _prebuffer_s()
 
         try:
             async for chunk in pcm_chunks:

@@ -83,6 +83,17 @@ tts-elevenlabs = [
     "stackchan-mcp[tts]",
     "miniaudio>=1.59",
 ]
+# Kokoro-82M local neural TTS (ONNX Runtime, CPU). Model files are
+# downloaded separately; see stackchan_mcp/tts/kokoro.py.
+tts-kokoro = [
+    "stackchan-mcp[tts]",
+    "kokoro-onnx>=0.4",
+]
+
+# show_image: decode and resize pictures for the 320x240 screen.
+screen = [
+    "Pillow>=10",
+]
 
 # Phase 4 STT — see Issue #91.
 # The base `stt` extra carries `opuslib` for decoding the device's

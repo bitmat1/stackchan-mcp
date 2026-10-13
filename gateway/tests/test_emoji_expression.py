@@ -42,3 +42,16 @@ def test_strip_emoji_for_plain_tts_keeps_no_emoji_text_exactly():
 
 def test_strip_emoji_for_plain_tts_removes_joined_sequences():
     assert strip_emoji_for_plain_tts("work 🧑‍💻 done") == "work done"
+
+
+def test_extended_faces_take_precedence(monkeypatch):
+    monkeypatch.delenv("STACKCHAN_EXTENDED_FACES", raising=False)
+    assert detect_emoji_face("so cute 😍") == "love"
+    assert detect_emoji_face("haha 😂") == "laughing"
+    assert detect_emoji_face("hmm 🤨") == "doubtful"
+
+
+def test_extended_faces_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("STACKCHAN_EXTENDED_FACES", "0")
+    assert detect_emoji_face("so cute 😍") == "happy"
+    assert detect_emoji_face("haha 😂") is None

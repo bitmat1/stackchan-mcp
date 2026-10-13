@@ -66,10 +66,25 @@ def _register_elevenlabs() -> None:
     get_registry().register(ElevenLabsEngine())
 
 
+def _register_macos_say() -> None:
+    from .macos_say import MacOSSayEngine, is_available
+
+    if is_available():
+        get_registry().register(MacOSSayEngine())
+
+
+def _register_kokoro() -> None:
+    from .kokoro import KokoroEngine
+
+    get_registry().register(KokoroEngine())
+
+
 _try_register(_register_voicevox, "voicevox")
 _try_register(_register_irodori, "irodori")
 _try_register(_register_edge_tts, "edge-tts")
 _try_register(_register_elevenlabs, "elevenlabs")
+_try_register(_register_macos_say, "macos-say")
+_try_register(_register_kokoro, "kokoro")
 
 
 __all__ = [
