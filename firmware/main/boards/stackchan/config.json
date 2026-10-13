@@ -41,7 +41,8 @@
                 "CONFIG_STACKCHAN_PITCH_MIN=50",
                 "CONFIG_STACKCHAN_PITCH_MAX=90",
                 "CONFIG_STACKCHAN_LCD_PCLK_MHZ=40",
-                "CONFIG_STACKCHAN_LCD_WEAK_DRIVE=n"
+                "CONFIG_STACKCHAN_LCD_WEAK_DRIVE=n",
+                "CONFIG_STACKCHAN_LISTEN_VOICE_CUE=y"
             ]
         }
     ]

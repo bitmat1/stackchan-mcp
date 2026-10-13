@@ -8,6 +8,7 @@
 #include "axp2101.h"
 #include "mcp_server.h"
 #include "settings.h"
+#include "assets/lang_config.h"
 #include "led_strip.h"
 // Issue #79: servo driver is selectable at build time via Kconfig.
 //   - CONFIG_STACKCHAN_SERVO_SCSCL  (default): GPL-3.0 SCServo_lib
@@ -989,12 +990,24 @@ private:
     bool si12t_ok_ = false;
     esp_timer_handle_t touch_poll_timer_ = nullptr;
     esp_timer_handle_t touch_revert_timer_ = nullptr;
+    // Spoken listen cue (CONFIG_STACKCHAN_LISTEN_VOICE_CUE): the mic opens
+    // once the cue has finished playing.
+    static constexpr int LISTEN_CUE_MAX_MS = 2500;
+    esp_timer_handle_t listen_cue_timer_ = nullptr;
+    std::atomic<bool> listen_cue_pending_{false};
+    bool listen_cue_drained_ = false;
+    uint64_t listen_cue_started_us_ = 0;
 
 #if CONFIG_STACKCHAN_BODY_SENSORS
     // On-board IMU and proximity sensor (body_sensors.h). Polled from the
     // body_poll esp_timer; the latest readings are kept for the get_* tools.
-    static constexpr int BODY_POLL_MS = 40;
-    static constexpr int PROXIMITY_EVERY = 5;  // proximity every 200 ms
+    // 50 Hz so the knock detector sees the short jolt of a tap (the IMU
+    // itself runs at 100 Hz).
+    static constexpr int BODY_POLL_MS = 20;
+    static constexpr int PROXIMITY_EVERY = 10;  // proximity every 200 ms
+    // No knocks while speaking or just after: the speaker shakes the body.
+    static constexpr uint32_t KNOCK_AFTER_SPEECH_MS = 1000;
+    uint32_t last_speaking_ms_ = 0;
     std::unique_ptr<body_sensors::Bmi270> imu_;
     std::unique_ptr<body_sensors::Ltr553> prox_;
     body_events::MotionDetector motion_detector_;
@@ -3272,34 +3285,102 @@ private:
                 // audio_input_hook) が listen.stop を受けて buffer を Ogg 化 +
                 // 外部 hook へ POST できる。Vessel UX として「タッチで listen
                 // 開始 → 発話 → タッチで送信」を成立させるための fork 専用分岐。
-                if (app.GetDeviceState() == kDeviceStateListening) {
-                    // 録音終了のフィードバック (= 全 LED 消灯)。 デバッグ目的、
-                    // MCP self.led.set_* 経由で上書き可能。
-                    SetAllRgbLeds(0, 0, 0);
-                    app.StopListening();
-                } else {
-                    // listening 開始は ToggleChatState ではなく StartListening
-                    // を使う。 ToggleChatState 経由は SetListeningMode に
-                    // GetDefaultListeningMode() (= AutoStop) を渡すため、
-                    // ペルソナ発話終了 (tts.stop) の Schedule 内で device が
-                    // 自動的に Listening 状態に再復帰してしまい (= xiaozhi の
-                    // 連続会話モデル、 application.cc:565)、 「タッチ駆動」 が
-                    // 破綻する (= 次のタッチが listen.stop 経路に入って即送信)。
-                    // StartListening 経由は HandleStartListeningEvent で
-                    // SetListeningMode(ManualStop) を強制するので、 tts.stop 後
-                    // は Idle に留まり、 次のタッチで明示的に listen 開始する
-                    // Vessel UX が成立する。 Idle 以外 (Speaking 等) でも
-                    // HandleStartListeningEvent が AbortSpeaking → ManualStop で
-                    // 適切に処理する。
-                    // 録音開始想定のフィードバック (= 全 LED 緑点灯、 控えめ
-                    // な輝度)。 実際の listen 起動は StartListening 経由で
-                    // 非同期処理。 タッチが取れたかどうかの体感を優先。
-                    SetAllRgbLeds(0, 32, 0);
-                    app.StartListening();
-                }
+                // listening 中の2回目タッチは StopListening、 それ以外は
+                // StartListening (詳細は ToggleTouchListening)。
+                ToggleTouchListening();
             }
         }
     }
+
+    // Start listening, or stop and send what was heard if already
+    // listening. Shared by a screen tap and a head tap.
+    void ToggleTouchListening() {
+        auto& app = Application::GetInstance();
+        const auto state = app.GetDeviceState();
+        if (listen_cue_pending_.load()) {
+            return;  // already on the way to listening
+        }
+        if (state == kDeviceStateListening) {
+            // 録音終了のフィードバック (= 全 LED 消灯)。 デバッグ目的、
+            // MCP self.led.set_* 経由で上書き可能。
+            SetAllRgbLeds(0, 0, 0);
+            app.StopListening();
+        } else {
+            // listening 開始は ToggleChatState ではなく StartListening
+            // を使う。 ToggleChatState 経由は SetListeningMode に
+            // GetDefaultListeningMode() (= AutoStop) を渡すため、
+            // ペルソナ発話終了 (tts.stop) の Schedule 内で device が
+            // 自動的に Listening 状態に再復帰してしまい (= xiaozhi の
+            // 連続会話モデル、 application.cc:565)、 「タッチ駆動」 が
+            // 破綻する (= 次のタッチが listen.stop 経路に入って即送信)。
+            // StartListening 経由は HandleStartListeningEvent で
+            // SetListeningMode(ManualStop) を強制するので、 tts.stop 後
+            // は Idle に留まり、 次のタッチで明示的に listen 開始する
+            // Vessel UX が成立する。 Idle 以外 (Speaking 等) でも
+            // HandleStartListeningEvent が AbortSpeaking → ManualStop で
+            // 適切に処理する。
+            // 録音開始想定のフィードバック (= 全 LED 緑点灯、 控えめ
+            // な輝度)。 実際の listen 起動は StartListening 経由で
+            // 非同期処理。 タッチが取れたかどうかの体感を優先。
+            SetAllRgbLeds(0, 32, 0);
+#if CONFIG_STACKCHAN_LISTEN_VOICE_CUE
+            if (state == kDeviceStateIdle) {
+                StartListeningAfterCue();
+                return;
+            }
+#endif
+            app.StartListening();
+        }
+    }
+
+#if CONFIG_STACKCHAN_LISTEN_VOICE_CUE
+    // Say listen_cue.ogg ("What do you want?"), then start listening without the
+    // popup beep. The mic opens only after the cue has played out, as
+    // there is no echo cancellation and it would otherwise be transcribed.
+    void StartListeningAfterCue() {
+        if (listen_cue_pending_.exchange(true)) return;
+        if (listen_cue_timer_ == nullptr) {
+            esp_timer_create_args_t args = {
+                .callback = [](void* arg) { static_cast<StackChanBoard*>(arg)->ListenCueTick(); },
+                .arg = this,
+                .dispatch_method = ESP_TIMER_TASK,
+                .name = "listen_cue",
+                .skip_unhandled_events = true,
+            };
+            if (esp_timer_create(&args, &listen_cue_timer_) != ESP_OK) {
+                listen_cue_pending_.store(false);
+                Application::GetInstance().StartListening();
+                return;
+            }
+        }
+        listen_cue_drained_ = false;
+        listen_cue_started_us_ = esp_timer_get_time();
+        Application::GetInstance().PlaySound(Lang::Sounds::OGG_LISTEN_CUE);
+        esp_timer_start_once(listen_cue_timer_, 300 * 1000);
+    }
+
+    void ListenCueTick() {
+        auto& app = Application::GetInstance();
+        const uint64_t elapsed_ms = (esp_timer_get_time() - listen_cue_started_us_) / 1000;
+        if (!listen_cue_drained_ && elapsed_ms < LISTEN_CUE_MAX_MS) {
+            if (!app.GetAudioService().IsPlaybackIdle()) {
+                esp_timer_start_once(listen_cue_timer_, 50 * 1000);
+                return;
+            }
+            // Queues are empty; let the last frame leave the speaker.
+            listen_cue_drained_ = true;
+            esp_timer_start_once(listen_cue_timer_, 150 * 1000);
+            return;
+        }
+        listen_cue_pending_.store(false);
+        if (app.GetDeviceState() == kDeviceStateIdle) {
+            app.SkipNextListeningCue();
+            app.StartListening();
+        } else {
+            SetAllRgbLeds(0, 0, 0);
+        }
+    }
+#endif
 
     void InitializeFt6336TouchPad() {
         ESP_LOGI(TAG, "Init FT6336");
@@ -4921,10 +5002,18 @@ private:
         LogTouchEvent("TAP", duration_ms);
         last_event_ = TouchEvent::TAP;
         last_event_us_ = esp_timer_get_time();
-        // Use the IfActive variant so a tap during set_avatar("off") does
-        // not pop the avatar back over the WiFi config / settings screens.
-        SetAvatarExpressionIfActive("surprised");
-        ScheduleIdleRevert();
+        // A tap on the head starts (or ends) listening, like a screen tap,
+        // whenever the robot is ready to talk. A stroke stays a pat.
+        auto state = Application::GetInstance().GetDeviceState();
+        if (state == kDeviceStateIdle || state == kDeviceStateListening ||
+            state == kDeviceStateSpeaking) {
+            ToggleTouchListening();
+        } else {
+            // Use the IfActive variant so a tap during set_avatar("off") does
+            // not pop the avatar back over the WiFi config / settings screens.
+            SetAvatarExpressionIfActive("surprised");
+            ScheduleIdleRevert();
+        }
         Application::GetInstance().SendStackChanEvent("touch", "tap", duration_ms);
     }
 
@@ -5066,6 +5155,11 @@ private:
     void InitializeBodySensors() {
         imu_ = std::make_unique<body_sensors::Bmi270>(i2c_bus_);
         if (!imu_->Begin()) imu_.reset();
+        {
+            Settings settings("body", false);
+            const int mg = settings.GetInt("knock_mg", 0);
+            if (mg > 0) motion_detector_.set_knock_threshold(mg / 1000.0f);
+        }
         prox_ = std::make_unique<body_sensors::Ltr553>(i2c_bus_);
         if (!prox_->Begin()) prox_.reset();
         if (!imu_ && !prox_) return;
@@ -5102,6 +5196,24 @@ private:
         Application::GetInstance().SendStackChanEvent(event_type, subtype, duration_ms);
     }
 
+    // A double knock on the robot acts like a screen tap: start listening
+    // when idle, stop and send when listening. Ignored while (or just
+    // after) speaking, when the speaker can shake the body.
+    void HandleKnock(uint32_t now_ms) {
+#if CONFIG_STACKCHAN_KNOCK_TO_LISTEN
+        const auto state = Application::GetInstance().GetDeviceState();
+        const bool quiet = now_ms - last_speaking_ms_ > KNOCK_AFTER_SPEECH_MS;
+        if ((state == kDeviceStateIdle && quiet) || state == kDeviceStateListening) {
+            BodyReact("imu", "knock", 0, nullptr);
+            ToggleTouchListening();
+            return;
+        }
+        ESP_LOGI(TAG, "knock ignored (state %d)", static_cast<int>(state));
+#else
+        BodyReact("imu", "knock", 0, nullptr);
+#endif
+    }
+
     void BodyPollTick() {
         const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
         if (imu_) {
@@ -5120,9 +5232,13 @@ private:
                     case MotionEvent::kPutDown: BodyReact("imu", Name(e), held_ms, "relieved"); break;
                     case MotionEvent::kTippedOver: BodyReact("imu", Name(e), held_ms, "dizzy"); break;
                     case MotionEvent::kShake: BodyReact("imu", Name(e), 0, "dizzy"); break;
+                    case MotionEvent::kKnock: HandleKnock(now_ms); break;
                     default: break;
                 }
             }
+        }
+        if (Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking) {
+            last_speaking_ms_ = now_ms;
         }
         if (prox_ && ++body_poll_count_ >= PROXIMITY_EVERY) {
             body_poll_count_ = 0;
@@ -7533,6 +7649,26 @@ private:
                 cJSON_AddItemToObject(root, "accel_g", cJSON_CreateFloatArray(a, 3));
                 cJSON_AddItemToObject(root, "gyro_dps", cJSON_CreateFloatArray(g, 3));
                 cJSON_AddBoolToObject(root, "held", motion_detector_.held());
+                cJSON_AddNumberToObject(root, "knock_threshold_g", motion_detector_.knock_threshold());
+                // Biggest jolt since the last read: knock, then read it to
+                // see what threshold would catch your knocks.
+                cJSON_AddNumberToObject(root, "peak_jolt_g", motion_detector_.TakePeakJerk());
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.sensors.set_knock_threshold",
+            "Set how hard a knock must be, in milli-g of sample-to-sample jolt "
+            "(default 250). Lower = more sensitive. Knock, then read peak_jolt_g "
+            "from get_motion to choose. Saved across reboots.",
+            PropertyList({Property("threshold_mg", kPropertyTypeInteger, 250, 50, 3000)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                const int mg = properties["threshold_mg"].value<int>();
+                motion_detector_.set_knock_threshold(mg / 1000.0f);
+                Settings settings("body", true);
+                settings.SetInt("knock_mg", mg);
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddNumberToObject(root, "knock_threshold_g", mg / 1000.0f);
                 return root;
             });
 

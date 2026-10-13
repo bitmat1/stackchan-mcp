@@ -8,7 +8,7 @@
 
 namespace body_events {
 
-enum class MotionEvent : uint8_t { kNone, kPickedUp, kPutDown, kTippedOver, kShake };
+enum class MotionEvent : uint8_t { kNone, kPickedUp, kPutDown, kTippedOver, kShake, kKnock };
 enum class ProximityEvent : uint8_t { kNone, kNear, kFar };
 
 inline const char* Name(MotionEvent e) {
@@ -17,6 +17,7 @@ inline const char* Name(MotionEvent e) {
         case MotionEvent::kPutDown: return "put_down";
         case MotionEvent::kTippedOver: return "tipped_over";
         case MotionEvent::kShake: return "shake";
+        case MotionEvent::kKnock: return "knock";
         default: return "";
     }
 }
@@ -46,12 +47,23 @@ public:
     static constexpr uint32_t kShakeWindowMs = 1500;
     static constexpr uint32_t kShakeCooldownMs = 3000;
     static constexpr float kTippedDeg = 40.0f;       // put down this far from upright
+    // Knock = two sharp jolts (sample-to-sample change in accel) 120..700 ms
+    // apart while the robot is resting: a double tap on the head or body.
+    // Requiring two keeps a bump of the table or setting it down from
+    // counting. The threshold is adjustable at run time (set_knock_threshold).
+    static constexpr float kKnockJerkG = 0.25f;
+    static constexpr uint32_t kKnockRingMs = 100;    // jolts this close = one knock
+    static constexpr uint32_t kKnockMinGapMs = 120;
+    static constexpr uint32_t kKnockMaxGapMs = 700;
+    static constexpr uint32_t kKnockRestMs = 300;    // still this long before the first
+    static constexpr uint32_t kKnockCooldownMs = 1500;
 
     // accel in g, gyro in deg/s. Returns at most one event per sample;
     // held_ms reports how long the robot was held for kPutDown/kTippedOver.
     MotionEvent Update(const float a[3], const float g[3], bool head_moving, uint32_t now_ms,
                        uint32_t* held_ms = nullptr) {
         if (head_moving) {
+            have_prev_ = false;
             head_still_since_ = now_ms;
             disturbed_since_ = 0;
             still_since_ = 0;
@@ -63,6 +75,37 @@ public:
         const float mag = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
         const float dev = std::fabs(mag - 1.0f);
         const float rot = std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+        const uint32_t still_for = still_since_ != 0 ? now_ms - still_since_ : 0;
+
+        float jerk = 0;
+        if (have_prev_) {
+            for (int i = 0; i < 3; i++) jerk += (a[i] - prev_[i]) * (a[i] - prev_[i]);
+            jerk = std::sqrt(jerk);
+        }
+        for (int i = 0; i < 3; i++) prev_[i] = a[i];
+        have_prev_ = true;
+        if (jerk > peak_jerk_) peak_jerk_ = jerk;
+        if (!held_ && jerk > knock_jerk_g_ && dev < kShakePeakG &&
+            now_ms - last_jolt_ms_ > kKnockRingMs) {
+            const uint32_t gap = now_ms - first_knock_ms_;
+            bool knocked = false;
+            if (knock_pending_ && gap >= kKnockMinGapMs && gap <= kKnockMaxGapMs) {
+                knock_pending_ = false;
+                knocked = now_ms - last_knock_ms_ > kKnockCooldownMs;
+            } else if (still_for >= kKnockRestMs) {
+                knock_pending_ = true;
+                first_knock_ms_ = now_ms;
+            } else {
+                knock_pending_ = false;
+            }
+            last_jolt_ms_ = now_ms;
+            if (knocked) {
+                last_knock_ms_ = now_ms;
+                return MotionEvent::kKnock;
+            }
+        } else if (jerk > knock_jerk_g_) {
+            last_jolt_ms_ = now_ms;  // still ringing from the same knock
+        }
 
         if (dev > kShakePeakG && now_ms - last_peak_ms_ > 80) {
             if (now_ms - first_peak_ms_ > kShakeWindowMs) {
@@ -125,6 +168,14 @@ public:
     }
 
     bool held() const { return held_; }
+    float knock_threshold() const { return knock_jerk_g_; }
+    void set_knock_threshold(float g) { knock_jerk_g_ = g; }
+    // Biggest sample-to-sample jolt since the last call, for tuning.
+    float TakePeakJerk() {
+        const float peak = peak_jerk_;
+        peak_jerk_ = 0;
+        return peak;
+    }
 
 private:
     float rest_[3] = {0, 0, 1};
@@ -138,6 +189,14 @@ private:
     uint32_t last_peak_ms_ = 0;
     uint32_t last_shake_ms_ = 0;
     int peaks_ = 0;
+    float prev_[3] = {0, 0, 0};
+    bool have_prev_ = false;
+    float knock_jerk_g_ = kKnockJerkG;
+    float peak_jerk_ = 0;
+    bool knock_pending_ = false;
+    uint32_t first_knock_ms_ = 0;
+    uint32_t last_jolt_ms_ = 0;
+    uint32_t last_knock_ms_ = 0;
 };
 
 // Raw LTR-553 counts include crosstalk through the cover glass, so "near"

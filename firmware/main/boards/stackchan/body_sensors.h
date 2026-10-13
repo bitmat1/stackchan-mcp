@@ -29,46 +29,28 @@ public:
     explicit Bmi270(i2c_master_bus_handle_t bus) : I2cDevice(bus, kAddr) {}
 
     // Uploads the feature config and starts accel (±4 g) and gyro
-    // (±1000 dps) at 100 Hz. Returns false if the chip is absent.
+    // (±1000 dps) at 100 Hz. Returns false if the chip is absent or will
+    // not initialise after a few attempts.
     bool Begin() {
         uint8_t id = 0;
         if (!Read(0x00, &id, 1) || id != 0x24) {
             ESP_LOGW(kTag, "BMI270 not found (chip id 0x%02X)", id);
             return false;
         }
-        Write(0x7C, 0x00);  // PWR_CONF: advanced power save off
-        vTaskDelay(pdMS_TO_TICKS(2));
-        Write(0x59, 0x00);  // INIT_CTRL: start config load
-        constexpr size_t kChunk = 64;
-        const size_t total = sizeof(blob::bmi270_config_file);
-        for (size_t off = 0; off < total; off += kChunk) {
-            Write(0x5B, static_cast<uint8_t>((off / 2) & 0x0F));  // INIT_ADDR_0
-            Write(0x5C, static_cast<uint8_t>((off / 2) >> 4));    // INIT_ADDR_1
-            uint8_t buf[kChunk + 1];
-            const size_t n = std::min(kChunk, total - off);
-            buf[0] = 0x5E;  // INIT_DATA
-            std::copy(blob::bmi270_config_file + off, blob::bmi270_config_file + off + n, buf + 1);
-            if (i2c_master_transmit(i2c_device_, buf, n + 1, 100) != ESP_OK) {
-                ESP_LOGW(kTag, "BMI270 config upload failed at %u", static_cast<unsigned>(off));
-                return false;
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            if (TryInit(attempt)) {
+                Write(0x7D, 0x0E);  // PWR_CTRL: accel, gyro, temperature on
+                Write(0x40, 0xA8);  // ACC_CONF: 100 Hz, normal filter, performance mode
+                Write(0x41, 0x01);  // ACC_RANGE: ±4 g
+                Write(0x42, 0xA8);  // GYR_CONF: 100 Hz, normal filter, performance mode
+                Write(0x43, 0x01);  // GYR_RANGE: ±1000 dps
+                Write(0x7C, 0x02);  // PWR_CONF: keep advanced power save off
+                ESP_LOGI(kTag, "BMI270 ready (attempt %d)", attempt);
+                return true;
             }
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
-        Write(0x59, 0x01);  // INIT_CTRL: done
-        vTaskDelay(pdMS_TO_TICKS(30));
-        uint8_t status = 0;
-        Read(0x21, &status, 1);  // INTERNAL_STATUS
-        if ((status & 0x0F) != 0x01) {
-            ESP_LOGW(kTag, "BMI270 init status 0x%02X", status);
-            return false;
-        }
-        Write(0x7D, 0x0E);  // PWR_CTRL: accel, gyro, temperature on
-        Write(0x40, 0xA8);  // ACC_CONF: 100 Hz, normal filter, performance mode
-        Write(0x41, 0x01);  // ACC_RANGE: ±4 g
-        Write(0x42, 0xA8);  // GYR_CONF: 100 Hz, normal filter, performance mode
-        Write(0x43, 0x01);  // GYR_RANGE: ±1000 dps
-        Write(0x7C, 0x02);  // PWR_CONF: keep advanced power save off
-        ESP_LOGI(kTag, "BMI270 ready");
-        return true;
+        return false;
     }
 
     // accel in g, gyro in deg/s.
@@ -84,6 +66,45 @@ public:
 
 private:
     static constexpr const char* kTag = "Bmi270";
+
+    // Soft reset, then upload the config blob. A soft reset first matters
+    // after an ESP32-only reset (flashing, reboot): the IMU is still
+    // powered and configured from the previous boot.
+    bool TryInit(int attempt) {
+        Write(0x7E, 0xB6);  // CMD: soft reset
+        vTaskDelay(pdMS_TO_TICKS(10));
+        // Until advanced power save is off, writes need 450 us gaps.
+        if (!Write(0x7C, 0x00)) {  // PWR_CONF: advanced power save off
+            ESP_LOGW(kTag, "BMI270 attempt %d: PWR_CONF write failed", attempt);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+        Write(0x59, 0x00);  // INIT_CTRL: start config load
+        constexpr size_t kChunk = 32;
+        const size_t total = sizeof(blob::bmi270_config_file);
+        for (size_t off = 0; off < total; off += kChunk) {
+            Write(0x5B, static_cast<uint8_t>((off / 2) & 0x0F));  // INIT_ADDR_0
+            Write(0x5C, static_cast<uint8_t>((off / 2) >> 4));    // INIT_ADDR_1
+            uint8_t buf[kChunk + 1];
+            const size_t n = std::min(kChunk, total - off);
+            buf[0] = 0x5E;  // INIT_DATA
+            std::copy(blob::bmi270_config_file + off, blob::bmi270_config_file + off + n, buf + 1);
+            const esp_err_t err = i2c_master_transmit(i2c_device_, buf, n + 1, 100);
+            if (err != ESP_OK) {
+                ESP_LOGW(kTag, "BMI270 attempt %d: config upload failed at %u: %s", attempt,
+                         static_cast<unsigned>(off), esp_err_to_name(err));
+                return false;
+            }
+        }
+        Write(0x59, 0x01);  // INIT_CTRL: done
+        vTaskDelay(pdMS_TO_TICKS(30));
+        uint8_t status = 0;
+        Read(0x21, &status, 1);  // INTERNAL_STATUS
+        if ((status & 0x0F) != 0x01) {
+            ESP_LOGW(kTag, "BMI270 attempt %d: init status 0x%02X", attempt, status);
+            return false;
+        }
+        return true;
+    }
 
     bool Read(uint8_t reg, uint8_t* out, size_t len) {
         return i2c_master_transmit_receive(i2c_device_, &reg, 1, out, len, 100) == ESP_OK;

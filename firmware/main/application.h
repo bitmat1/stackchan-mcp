@@ -110,6 +110,12 @@ public:
      */
     void StopListening();
 
+    /**
+     * Skip the popup cue on the next listening start, for a caller that
+     * has already played its own cue (thread-safe).
+     */
+    void SkipNextListeningCue() { skip_next_listening_cue_.store(true); }
+
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");
@@ -166,6 +172,7 @@ private:
     bool aborted_ = false;
     bool assets_version_checked_ = false;
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
+    std::atomic<bool> skip_next_listening_cue_{false};
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 

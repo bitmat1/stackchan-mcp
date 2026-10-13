@@ -15,7 +15,7 @@ constexpr float kUpright[3] = {0, 0, 1};
 constexpr float kOnSide[3] = {1, 0, 0};
 constexpr float kNoSpin[3] = {0, 0, 0};
 constexpr float kSpin[3] = {0, 60, 0};
-constexpr uint32_t kStep = 40;  // firmware samples at 25 Hz
+constexpr uint32_t kStep = 20;  // firmware samples at 50 Hz
 
 struct Feed {
     MotionDetector det;
@@ -101,6 +101,57 @@ TEST(MotionDetectorTest, SingleBumpIsNotAShake) {
     f.Run(jolt, kNoSpin, kStep);
     f.Run(kUpright, kNoSpin, 3000);
     for (auto e : f.events) EXPECT_NE(e, MotionEvent::kShake);
+}
+
+// One knock: a single sample knocked sideways, then back to rest.
+constexpr float kKnocked[3] = {0.35f, 0, 0.95f};
+
+void Knock(Feed& f) {
+    f.Run(kKnocked, kNoSpin, kStep);
+}
+
+TEST(MotionDetectorTest, DoubleKnockAtRestIsAKnock) {
+    Feed f;
+    f.Run(kUpright, kNoSpin, 3000);
+    Knock(f);
+    f.Run(kUpright, kNoSpin, 280);
+    Knock(f);
+    f.Run(kUpright, kNoSpin, 2000);
+    ASSERT_EQ(f.events.size(), 1u);
+    EXPECT_EQ(f.events[0], MotionEvent::kKnock);
+}
+
+TEST(MotionDetectorTest, SingleKnockOrSlowKnocksAreNothing) {
+    Feed f;
+    f.Run(kUpright, kNoSpin, 3000);
+    Knock(f);
+    f.Run(kUpright, kNoSpin, 1500);
+    Knock(f);
+    f.Run(kUpright, kNoSpin, 2000);
+    EXPECT_TRUE(f.events.empty());
+}
+
+TEST(MotionDetectorTest, KnockThresholdIsAdjustable) {
+    Feed f;
+    f.det.set_knock_threshold(0.5f);
+    f.Run(kUpright, kNoSpin, 3000);
+    Knock(f);
+    f.Run(kUpright, kNoSpin, 280);
+    Knock(f);
+    f.Run(kUpright, kNoSpin, 2000);
+    EXPECT_TRUE(f.events.empty());
+    EXPECT_GT(f.det.TakePeakJerk(), 0.3f);
+    EXPECT_EQ(f.det.TakePeakJerk(), 0.0f);
+}
+
+TEST(MotionDetectorTest, KnocksWhileHeadMovesAreIgnored) {
+    Feed f;
+    f.Run(kUpright, kNoSpin, 3000);
+    f.Run(kKnocked, kNoSpin, kStep, true);
+    f.Run(kUpright, kNoSpin, 280, true);
+    f.Run(kKnocked, kNoSpin, kStep, true);
+    f.Run(kUpright, kNoSpin, 2000);
+    EXPECT_TRUE(f.events.empty());
 }
 
 TEST(ProximityDetectorTest, NearThenFarWithDuration) {
