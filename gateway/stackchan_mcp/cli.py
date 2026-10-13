@@ -109,7 +109,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable mDNS/DNS-SD advertisement for the WebSocket endpoint.",
     )
-    subparsers = parser.add_subparsers(dest="command", metavar="{serve}")
+    subparsers = parser.add_subparsers(dest="command", metavar="{serve,channel,app}")
     serve_parser = subparsers.add_parser(
         "serve",
         help="Start the StackChan gateway.",
@@ -127,6 +127,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         dest="serve_no_mdns",
         action="store_true",
         help="Disable mDNS/DNS-SD advertisement for the WebSocket endpoint.",
+    )
+    subparsers.add_parser(
+        "channel",
+        help="Run the stdio Claude Code channel bridge to a running daemon.",
+        description=(
+            "Proxy tools and channel events between a Claude Code session "
+            "(stdio) and a running `serve --transport streamable-http` daemon. "
+            "See stackchan_mcp/channel_bridge.py."
+        ),
+    )
+    subparsers.add_parser(
+        "app",
+        help="Start the gateway and open the control panel (and voice session).",
+        description=(
+            "Start the Streamable HTTP gateway if it is not running, open the "
+            "web control panel in an app window and, with the Claude brain, "
+            "the Claude Code voice session. See stackchan_mcp/app.py."
+        ),
     )
     return parser
 
@@ -981,6 +999,17 @@ def main(argv: list[str] | None = None) -> None:
     if args.command is None:
         _run_stdio_gateway(advertise_mdns=not args.no_mdns)
         return
+
+    if args.command == "channel":
+        from .channel_bridge import run_channel_bridge
+
+        run_channel_bridge()
+        return
+
+    if args.command == "app":
+        from .app import run_app
+
+        sys.exit(run_app())
 
     if args.command == "serve":
         advertise_mdns = not (args.no_mdns or getattr(args, "serve_no_mdns", False))

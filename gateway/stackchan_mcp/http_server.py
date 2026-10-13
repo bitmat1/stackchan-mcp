@@ -6,7 +6,9 @@ import asyncio
 import contextlib
 import ipaddress
 import json
+import logging
 import os
+import signal
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -32,10 +34,14 @@ from starlette.types import Receive, Scope, Send
 
 from .notify_config import NotifyConfig
 from .queue import CommandQueue, QueueFull, QueueItem, build_queue_full_error
+from . import activity
 from .stdio_server import _dispatch_mcp_tool, create_server
+from .web_ui import build_web_routes
 
 # Follower lifecycle operations must remain callable when the ESP32 is
 # disconnected so HTTP clients can supervise the background task.
+logger = logging.getLogger(__name__)
+
 BYPASS_TOOLS = frozenset({"get_status", "stackchan_follow_pose_stream"})
 MCP_HTTP_ALLOWED_HOSTS_ENV = "MCP_HTTP_ALLOWED_HOSTS"
 AUTH_FAILURE_MESSAGE = "Unauthorized: missing or invalid bearer token"
@@ -86,6 +92,7 @@ def make_dispatch_fn(gateway: Any) -> DispatchFn:
     """Build the single-flight ESP32 dispatcher used by the command queue."""
 
     async def dispatch(item: QueueItem) -> list[TextContent | ImageContent]:
+        activity.source_var.set(activity.source_for_session(item.client_session_id))
         if not gateway.esp32.device_connected:
             return [
                 TextContent(
@@ -151,9 +158,14 @@ def build_app(
                 dispatcher_task = asyncio.create_task(
                     queue.run_dispatcher(_skip_done_dispatch(dispatch_fn))
                 )
+            activity.record("system", "gateway started", source="gateway")
+            watchdog = _watch_launcher()
             try:
                 yield
             finally:
+                if watchdog is not None:
+                    watchdog.cancel()
+                activity.record("system", "gateway stopping", source="gateway")
                 if dispatcher_task is not None:
                     dispatcher_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -169,6 +181,13 @@ def build_app(
         ),
         Route("/healthz", endpoint=healthz, methods=["GET"]),
         Route("/status", endpoint=status, methods=["GET"]),
+        *build_web_routes(
+            server=server,
+            queue=queue,
+            bypass_tools=BYPASS_TOOLS,
+            direct_dispatch=lambda name, args: _dispatch_mcp_tool(name, args, gateway),
+            gateway=gateway,
+        ),
     ]
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.command_queue = queue
@@ -240,6 +259,32 @@ def _install_queue_tool_handler(
         return _tool_result(content_or_error)
 
     server.request_handlers[CallToolRequest] = handler
+
+
+def _watch_launcher() -> asyncio.Task[None] | None:
+    """When started by Stack-chan.app, exit if the app's launcher dies.
+
+    Otherwise a force-quit app would leave this gateway holding its ports,
+    and the next launch could not start a fresh one.
+    """
+    raw = os.getenv("STACKCHAN_LAUNCHER_PID", "")
+    if not raw.isdigit():
+        return None
+    pid = int(raw)
+
+    async def watch() -> None:
+        while True:
+            await asyncio.sleep(5)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                logger.warning("launcher (pid %d) is gone; shutting the gateway down", pid)
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
+            except PermissionError:
+                pass  # alive, owned by someone else
+
+    return asyncio.create_task(watch())
 
 
 def _skip_done_dispatch(dispatch_fn: DispatchFn) -> DispatchFn:
@@ -379,7 +424,8 @@ class _GuardedASGIApp:
                 send,
             )
             return
-        if self._token and scope.get("path") in {"/mcp", "/status"}:
+        path = scope.get("path", "")
+        if self._token and (path in {"/mcp", "/status"} or path.startswith("/api/")):
             expected = f"Bearer {self._token}"
             if request.headers.get("authorization") != expected:
                 await PlainTextResponse(
