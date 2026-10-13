@@ -38,6 +38,9 @@ from pathlib import Path
 GATEWAY_DIR = Path(__file__).resolve().parent.parent
 VOICE_SESSION_DIR = GATEWAY_DIR.parent / "voice-session"
 LOG_PATH = Path.home() / "Library" / "Logs" / "stackchan-gateway.log"
+#: Variables this launcher took from .env, left out of each gateway's
+#: environment so the gateway reads .env afresh and picks up edits.
+_dotenv_keys: set[str] = set()
 #: Chromium browsers that can open a page as a chromeless app window.
 APP_WINDOW_BROWSERS = ("Google Chrome", "Microsoft Edge", "Brave Browser", "Chromium")
 
@@ -65,7 +68,10 @@ def start_gateway(extra_env: dict[str, str] | None = None) -> subprocess.Popen[b
         cwd=GATEWAY_DIR,
         stdout=log,
         stderr=subprocess.STDOUT,
-        env={**os.environ, **(extra_env or {})},
+        env={
+            **{k: v for k, v in os.environ.items() if k not in _dotenv_keys},
+            **(extra_env or {}),
+        },
     )
 
 
@@ -269,7 +275,9 @@ def run_app() -> int:
     from .brain import brain_mode
     from .cli import _load_dotenv
 
+    before = set(os.environ)
     _load_dotenv()
+    _dotenv_keys.update(set(os.environ) - before)
     url = base_url()
     port = int(os.getenv("STACKCHAN_LAUNCHER_PORT", "8768"))
     launcher_url = f"http://127.0.0.1:{port}"

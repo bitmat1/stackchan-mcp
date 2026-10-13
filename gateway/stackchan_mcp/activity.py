@@ -60,4 +60,6 @@ def source_for_session(client_session_id: str) -> str:
         return "panel"
     if client_session_id == "ollama-brain":
         return "ollama"
+    if client_session_id == "timers":
+        return "timer"
     return "claude"

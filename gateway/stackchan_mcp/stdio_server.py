@@ -6,6 +6,7 @@ Each tool call is relayed to the connected ESP32 device.
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import AsyncExitStack
 import inspect
 import json
@@ -19,7 +20,7 @@ from mcp.server.session import ServerSession
 from mcp.server.stdio import stdio_server
 from mcp.types import ImageContent, Notification, TextContent, Tool
 
-from . import __version__
+from . import __version__, timers
 from .gateway import get_gateway
 from .faces import available_faces
 from .gestures import GESTURE_NAMES
@@ -1010,6 +1011,9 @@ async def _dispatch_mcp_tool_inner(
     if name == "beat_clip_save":
         return await _handle_beat_clip_save(arguments)
 
+    if name in timers.TOOL_NAMES:
+        return await timers.handle_tool(name, arguments)
+
     if not gateway.esp32.device_connected:
         return [
             TextContent(
@@ -1247,6 +1251,10 @@ async def _dispatch_mcp_tool_inner(
         "get_proximity": (
             "self.sensors.get_proximity",
             {},
+        ),
+        "set_knock_threshold": (
+            "self.sensors.set_knock_threshold",
+            arguments,
         ),
         "set_led": (
             "self.led.set_color",
@@ -2339,12 +2347,31 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                 description=(
                     "Read the robot's motion sensor (BMI270 IMU): acceleration in g, "
                     "rotation in deg/s, and whether it is currently being held. "
-                    "Being picked up, put down, tipped over or shaken also arrives "
-                    "as an imu event on its own."
+                    "Being picked up, put down, tipped over, shaken or knocked "
+                    "twice also arrives as an imu event on its own. Also returns "
+                    "knock_threshold_g and peak_jolt_g, the biggest jolt since the "
+                    "last read (for tuning knock-to-listen)."
                 ),
                 inputSchema={
                     "type": "object",
                     "properties": {},
+                },
+            ),
+            Tool(
+                name="set_knock_threshold",
+                description=(
+                    "Set how hard a double knock on the robot must be to start "
+                    "listening, in milli-g (default 250; lower = more sensitive). "
+                    "Have the person knock, read peak_jolt_g from get_motion, and "
+                    "pick a value a little below their knocks but above the noise. "
+                    "Saved on the robot."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "threshold_mg": {"type": "integer", "minimum": 50, "maximum": 3000},
+                    },
+                    "required": ["threshold_mg"],
                 },
             ),
             Tool(
@@ -3257,6 +3284,7 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                     "required": ["archive_path", "mode"],
                 },
             ),
+            *timers.TOOLS,
         ]
 
     @server.call_tool()
@@ -3275,6 +3303,8 @@ async def run_stdio_server(notify_config: NotifyConfig | None = None) -> None:
     if notify_config is None:
         notify_config = load_notify_config()
     server = create_server(notify_config=notify_config)
+    timers.register_tool_runner(lambda name, args: _dispatch_mcp_tool(name, args, get_gateway()))
+    scheduler = asyncio.create_task(timers.run_scheduler())
     async with stdio_server() as (read_stream, write_stream):
         logger.info("stdio MCP server starting")
         await server.run(
@@ -3282,3 +3312,4 @@ async def run_stdio_server(notify_config: NotifyConfig | None = None) -> None:
             write_stream,
             _create_initialization_options(server, notify_config),
         )
+    scheduler.cancel()

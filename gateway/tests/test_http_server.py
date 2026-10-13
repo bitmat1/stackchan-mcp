@@ -10,6 +10,7 @@ import pytest
 from mcp.server.streamable_http import MCP_SESSION_ID_HEADER
 from mcp.types import ErrorData, TextContent
 
+from stackchan_mcp import timers
 from stackchan_mcp.http_server import (
     AUTH_FAILURE_MESSAGE,
     BYPASS_TOOLS,
@@ -467,7 +468,7 @@ def test_bypass_tools_include_status_and_follow_pose_stream() -> None:
 
 @pytest.mark.asyncio
 async def test_bypass_tool_get_status_does_not_enter_dispatcher() -> None:
-    assert BYPASS_TOOLS == frozenset({"get_status", "stackchan_follow_pose_stream"})
+    assert BYPASS_TOOLS == frozenset({"get_status", "stackchan_follow_pose_stream"}) | timers.TOOL_NAMES
     queue = CommandQueue(capacity=2)
 
     async def dispatch(_item: QueueItem):
@@ -578,3 +579,27 @@ async def test_command_queue_raises_queue_full_directly() -> None:
                 enqueued_at=0.0,
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_api_timers_lists_pending_timers_soonest_first(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("STACKCHAN_TIMERS_FILE", str(tmp_path / "timers.json"))
+    timers._reset_for_tests()
+    monkeypatch.setattr(timers, "run_scheduler", lambda: asyncio.sleep(3600))
+    later = timers.add("alarm", "", 2_000_000_000.0, "daily")
+    sooner = timers.add("timer", "tea", 1_900_000_000.0)
+    app = build_app(
+        CommandQueue(capacity=2), gateway=FakeGateway(), owner_id="o", host="127.0.0.1", port=8767
+    )
+    try:
+        async with _client(app) as client:
+            response = await client.get("/api/timers")
+    finally:
+        timers._reset_for_tests()
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [t["id"] for t in payload["timers"]] == [sooner.id, later.id]
+    assert payload["timers"][0]["message"] == "tea"
+    assert payload["timers"][1]["repeat"] == "daily"
+    assert payload["now"] > 0

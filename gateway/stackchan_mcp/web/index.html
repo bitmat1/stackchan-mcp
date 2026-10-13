@@ -99,6 +99,13 @@ section.min .body { display: none; }
 #fields .field { margin-bottom: 8px; }
 #fields .field label { display: block; margin-bottom: 2px; }
 #fields input[type=text], #fields input[type=number] { width: 100%; }
+.timers { display: grid; gap: 6px; }
+.timer { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; align-items: center;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; }
+.timer .left { font: 600 20px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums; }
+.timer.soon .left { color: var(--accent); }
+.timer .meta { grid-column: 1; font-size: 12px; color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
+.timer button { grid-column: 2; grid-row: 1 / span 2; padding: 4px 8px; font-size: 13px; }
 .hint { font-size: 12px; color: var(--muted); margin: 0 0 10px; }
 </style>
 </head>
@@ -182,6 +189,11 @@ section.min .body { display: none; }
     <h2>Robot health</h2>
     <dl class="health" id="health"><dt>Status</dt><dd>checking…</dd></dl>
     <div class="row" style="margin-top:10px"><button id="healthBtn">Refresh</button></div>
+  </section>
+
+  <section>
+    <h2>Timers</h2>
+    <div class="timers" id="timers"><p class="hint">checking…</p></div>
   </section>
 
   <section>
@@ -461,6 +473,45 @@ async function refreshHealth(force) {
   $("health").innerHTML = rows.join("");
 }
 $("healthBtn").onclick = () => refreshHealth(true);
+
+// Timers, reminders and alarms: fetched every few seconds, counted down every second.
+const KIND_ICON = { timer: "⏲", reminder: "📝", alarm: "⏰" };
+let timerList = [], clockSkew = 0;  // server time minus browser time, in seconds
+function fmtLeft(s) {
+  s = Math.max(0, Math.round(s));
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const hms = `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+  return d ? `${d}d ${hms}` : hms;
+}
+function renderTimers() {
+  const box = $("timers");
+  if (!timerList.length) { box.innerHTML = '<p class="hint">No timers, reminders or alarms. Ask Stack-chan to set one.</p>'; return; }
+  const now = Date.now() / 1000 + clockSkew;
+  box.replaceChildren(...timerList.map((t) => {
+    const left = t.due - now;
+    const row = document.createElement("div");
+    row.className = `timer${left < 60 ? " soon" : ""}`;
+    row.innerHTML = `<span class="left"></span><button title="Cancel">Cancel</button><span class="meta"></span>`;
+    row.children[0].textContent = left > 0 ? fmtLeft(left) : "now";
+    const repeat = t.repeat !== "once" ? ` · ${t.repeat}` : "";
+    const at = new Date(t.due * 1000).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+    row.children[2].textContent = `${KIND_ICON[t.kind] || ""} ${t.kind} · ${at}${repeat}${t.message ? ` — ${t.message}` : ""}`;
+    row.children[1].onclick = async (e) => {
+      try { await call("cancel_timer", { id: t.id }, e.target); } catch { return; }
+      refreshTimers();
+    };
+    return row;
+  }));
+}
+async function refreshTimers() {
+  if (gatewayDown) return;
+  try {
+    const r = await api("/api/timers");
+    clockSkew = r.now - Date.now() / 1000;
+    timerList = r.timers;
+  } catch { return; }
+  renderTimers();
+}
 
 async function refreshStatus() {
   try {
@@ -787,6 +838,9 @@ $("askBtn").onclick = async (e) => {
   setInterval(pollActivity, 1500);
   refreshHealth();
   setInterval(refreshHealth, 15000);
+  refreshTimers();
+  setInterval(refreshTimers, 5000);
+  setInterval(renderTimers, 1000);
   syncHeadUI();
   try {
     const data = await api("/api/tools");

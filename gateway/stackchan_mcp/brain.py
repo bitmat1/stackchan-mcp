@@ -20,6 +20,12 @@ directory, ~/Library/Application Support/stackchan-mcp on macOS):
     STACKCHAN_BRAIN         "claude" (default) or "ollama"
     OLLAMA_URL              default http://127.0.0.1:11434
     STACKCHAN_OLLAMA_MODEL  default: an installed llama/qwen model, else "llama3.1"
+    STACKCHAN_MEMORY_FILE   default: voice-session/ROBOT_MEMORY.md, the memory
+                            file the Claude voice session also reads
+
+The memory file is re-read every turn, so edits take effect straight away.
+The model saves a note by adding ``[remember: note]`` to its reply; the tag
+is taken out of the spoken text and the note appended to the file.
 """
 
 from __future__ import annotations
@@ -51,6 +57,10 @@ KEEP_ALIVE = "30m"
 NUM_CTX = 4096
 FALLBACK_FACES = ("idle", "happy", "thinking", "sad", "surprised", "embarrassed")
 FALLBACK_GESTURES = ("nod", "shake", "tilt")
+DEFAULT_MEMORY_FILE = Path(__file__).resolve().parent.parent.parent / "voice-session" / "ROBOT_MEMORY.md"
+#: Cap on how much of the memory file goes into the prompt (NUM_CTX is small).
+MEMORY_MAX_CHARS = 6000
+MEMORY_NOTE_MAX_CHARS = 200
 
 SYSTEM_PROMPT = """\
 You are Stack-chan, a small, friendly desk robot. You have a face on a \
@@ -65,8 +75,19 @@ Expressions: {faces}
 Gestures: {gestures}
 
 What you say is spoken aloud: one to three short, warm, natural sentences, \
-no markdown, lists, emoji or URLs."""
+no markdown, lists, emoji or URLs.
+
+When the person asks you to remember something, or tells you something \
+about themselves worth keeping, end your reply with the note in square \
+brackets, then say you will remember it. Example: [happy] [nod] Got it, \
+I'll remember that! [remember: The owner's cat is called Miso.]"""
+MEMORY_PROMPT = """
+
+Your memory notes follow. Follow them and use them when they help.
+
+{memory}"""
 _TAG = re.compile(r"^\s*\[([a-z_ ]+)\]", re.IGNORECASE)
+_REMEMBER = re.compile(r"\[\s*remember\s*:\s*([^\]]*)\]", re.IGNORECASE)
 _THINK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 ToolRunner = Callable[[str, dict[str, Any]], Awaitable[Any]]
@@ -77,6 +98,42 @@ _runner: ToolRunner | None = None
 _schema_loader: SchemaLoader | None = None
 _history: deque[dict[str, Any]] = deque(maxlen=HISTORY_TURNS * 2)
 _lock = asyncio.Lock()
+
+
+def memory_path() -> Path:
+    return Path(os.getenv("STACKCHAN_MEMORY_FILE") or DEFAULT_MEMORY_FILE).expanduser()
+
+
+def load_memory() -> str:
+    """The robot's memory notes, or "" when the file is missing."""
+    try:
+        text = memory_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    return text[:MEMORY_MAX_CHARS]
+
+
+def extract_memories(text: str) -> tuple[list[str], str]:
+    """Pull ``[remember: note]`` tags out of ``text``; returns (notes, rest)."""
+    notes = [" ".join(m.split()) for m in _REMEMBER.findall(text)]
+    rest = " ".join(_REMEMBER.sub(" ", text).split())
+    return [n[:MEMORY_NOTE_MAX_CHARS] for n in notes if n], rest
+
+
+def save_memory(note: str) -> bool:
+    """Append ``note`` to the memory file; False if it was already there."""
+    path = memory_path()
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        existing = "# Stack-chan's memory\n"
+    if any(line.lstrip("- ").strip() == note for line in existing.splitlines()):
+        return False
+    if not existing.endswith("\n"):
+        existing += "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{existing}- {note}\n", encoding="utf-8")
+    return True
 
 
 def settings_path() -> Path:
@@ -227,6 +284,8 @@ async def respond(text: str) -> str:
     async with _lock:  # one conversation turn at a time
         faces, gestures = await _choices()
         system = SYSTEM_PROMPT.format(faces=", ".join(faces), gestures=", ".join(gestures))
+        if memory := load_memory():
+            system += MEMORY_PROMPT.format(memory=memory)
         messages = [{"role": "system", "content": system}, *_history, {"role": "user", "content": text}]
         model = chosen_model() or ollama_model((await list_ollama_models())[1])
         await _run("set_avatar", {"face": "thinking"})
@@ -240,12 +299,22 @@ async def respond(text: str) -> str:
             await _run("set_avatar", {"face": "sad"})
             await _say("Sorry, my local brain isn't answering. Is Ollama running?")
             return ""
-        face, gesture, reply = parse_reply(raw, faces, gestures)
+        answer = _THINK.sub("", raw).strip()
+        notes, untagged = extract_memories(answer)
+        for note in notes:
+            try:
+                if save_memory(note):
+                    from . import activity
+
+                    activity.record("system", f"remembered: {note}", source="ollama")
+            except OSError as exc:
+                logger.warning("brain: could not save memory %r: %s", note, exc)
+        face, gesture, reply = parse_reply(untagged, faces, gestures)
         if not reply:
             reply = "Hmm, I'm not sure what to say."
         _history.append({"role": "user", "content": text})
         # Remember the tagged form so the model keeps using the format.
-        _history.append({"role": "assistant", "content": _THINK.sub("", raw).strip() or reply})
+        _history.append({"role": "assistant", "content": answer or reply})
         await _run("set_avatar", {"face": face or "idle"})
         if gesture:
             await _run("gesture", {"name": gesture})

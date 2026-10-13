@@ -34,7 +34,7 @@ from starlette.types import Receive, Scope, Send
 
 from .notify_config import NotifyConfig
 from .queue import CommandQueue, QueueFull, QueueItem, build_queue_full_error
-from . import activity
+from . import activity, timers
 from .stdio_server import _dispatch_mcp_tool, create_server
 from .web_ui import build_web_routes
 
@@ -42,7 +42,7 @@ from .web_ui import build_web_routes
 # disconnected so HTTP clients can supervise the background task.
 logger = logging.getLogger(__name__)
 
-BYPASS_TOOLS = frozenset({"get_status", "stackchan_follow_pose_stream"})
+BYPASS_TOOLS = frozenset({"get_status", "stackchan_follow_pose_stream"}) | timers.TOOL_NAMES
 MCP_HTTP_ALLOWED_HOSTS_ENV = "MCP_HTTP_ALLOWED_HOSTS"
 AUTH_FAILURE_MESSAGE = "Unauthorized: missing or invalid bearer token"
 HOST_FAILURE_MESSAGE = "Forbidden: invalid Host header"
@@ -160,9 +160,11 @@ def build_app(
                 )
             activity.record("system", "gateway started", source="gateway")
             watchdog = _watch_launcher()
+            scheduler = asyncio.create_task(timers.run_scheduler())
             try:
                 yield
             finally:
+                scheduler.cancel()
                 if watchdog is not None:
                     watchdog.cancel()
                 activity.record("system", "gateway stopping", source="gateway")

@@ -9,6 +9,7 @@ Endpoints:
 
     GET  /ui                  the control panel page
     GET  /api/tools           tool names, descriptions and input schemas
+    GET  /api/timers          pending timers, reminders and alarms
     POST /api/tool/{name}     run a tool; JSON body = tool arguments
 
 Results come back as ``{"content": [...]}`` where each item is either
@@ -33,12 +34,13 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
-from . import activity, brain
+from . import activity, brain, timers
 from .queue import CommandQueue, QueueFull, QueueItem
 
 WEB_DIR = Path(__file__).parent / "web"
 WEB_CLIENT_SESSION_ID = "web-ui"
 BRAIN_SESSION_ID = "ollama-brain"
+TIMER_SESSION_ID = "timers"
 TOOL_TIMEOUT_SECONDS = 180.0
 
 class RobotBusy(RuntimeError):
@@ -177,6 +179,11 @@ def build_web_routes(
 
     brain.register_tool_runner(brain_tool, tool_schemas)
 
+    async def timer_tool(name: str, arguments: dict[str, Any]) -> list[Any]:
+        return await run_tool(name, arguments, TIMER_SESSION_ID)
+
+    timers.register_tool_runner(timer_tool)
+
     async def page(_request: Request) -> FileResponse:
         return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
@@ -277,6 +284,13 @@ def build_web_routes(
         entries = activity.since(after)
         return JSONResponse({"entries": entries, "last_id": entries[-1]["id"] if entries else after})
 
+    async def get_timers(_request: Request) -> JSONResponse:
+        """Read straight from the schedule, so the panel's once-a-few-
+        seconds poll stays out of the command queue and the activity feed."""
+        return JSONResponse(
+            {"now": time.time(), "timers": [t.describe() for t in timers.pending()]}
+        )
+
     async def get_health(_request: Request) -> JSONResponse:
         if gateway is None:
             return JSONResponse({"connected": False})
@@ -299,6 +313,7 @@ def build_web_routes(
         Route("/api/gateway/shutdown", endpoint=shutdown, methods=["POST"]),
         Route("/api/activity", endpoint=get_activity, methods=["GET"]),
         Route("/api/health", endpoint=get_health, methods=["GET"]),
+        Route("/api/timers", endpoint=get_timers, methods=["GET"]),
         Route("/api/launcher", endpoint=get_launcher, methods=["GET"]),
         Route("/api/tools", endpoint=list_tools, methods=["GET"]),
         Route("/api/tool/{name}", endpoint=call_tool, methods=["POST"]),

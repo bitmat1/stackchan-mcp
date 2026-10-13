@@ -19,6 +19,7 @@ def _isolated_brain(tmp_path, monkeypatch):
     monkeypatch.setattr(brain, "settings_path", lambda: tmp_path / "brain.json")
     monkeypatch.delenv("STACKCHAN_BRAIN", raising=False)
     monkeypatch.delenv("STACKCHAN_OLLAMA_MODEL", raising=False)
+    monkeypatch.setenv("STACKCHAN_MEMORY_FILE", str(tmp_path / "memory.md"))
     brain._override.clear()
     brain._history.clear()
     yield
@@ -124,6 +125,51 @@ async def test_respond_shows_face_and_gesture_then_speaks(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_respond_includes_memory_file(monkeypatch, tmp_path):
+    _record_tools()
+    seen: list[list[dict[str, Any]]] = []
+
+    async def fake_chat(messages, model):
+        seen.append(messages)
+        return "[happy] Hi!"
+
+    monkeypatch.setattr(brain, "_chat", fake_chat)
+    monkeypatch.setattr(brain, "list_ollama_models", _no_models)
+    await brain.respond("hi")
+    assert "memory notes" not in seen[0][0]["content"]
+
+    (tmp_path / "memory.md").write_text("- The owner's cat is called Miso.\n")
+    await brain.respond("hi again")
+    assert "The owner's cat is called Miso." in seen[1][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_respond_saves_remember_tags(monkeypatch, tmp_path):
+    calls = _record_tools()
+
+    async def fake_chat(messages, model):
+        return "[happy] [nod] Got it, I'll remember! [remember: The owner's cat is called Miso.]"
+
+    monkeypatch.setattr(brain, "_chat", fake_chat)
+    monkeypatch.setattr(brain, "list_ollama_models", _no_models)
+    assert await brain.respond("my cat is Miso") == "Got it, I'll remember!"
+    assert calls[-1] == ("say", {"text": "Got it, I'll remember!"})
+    memory = tmp_path / "memory.md"
+    assert memory.read_text().endswith("- The owner's cat is called Miso.\n")
+
+    await brain.respond("my cat is Miso")  # the same note is not saved twice
+    assert memory.read_text().count("Miso") == 1
+
+
+def test_extract_memories():
+    assert brain.extract_memories("Sure! [Remember:  likes  tea ] [remember:]") == (
+        ["likes tea"],
+        "Sure!",
+    )
+    assert brain.extract_memories("[happy] Hi") == ([], "[happy] Hi")
+
+
+@pytest.mark.asyncio
 async def test_respond_without_tags_goes_back_to_idle(monkeypatch):
     calls = _record_tools()
 
@@ -167,3 +213,17 @@ def test_claude_session_script_quotes_paths():
     assert 'do script "' in script
     assert "--dangerously-load-development-channels server:stackchan" in script
     assert '\\"x\\"' in script  # inner quotes escaped for AppleScript
+
+
+def test_launched_gateway_reads_env_file_afresh(monkeypatch, tmp_path):
+    """Values the launcher took from .env are not passed on, so edits apply."""
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(app, "LOG_PATH", tmp_path / "gateway.log")
+    monkeypatch.setattr(app.subprocess, "Popen", lambda *a, **kw: seen.update(kw))
+    monkeypatch.setattr(app, "_dotenv_keys", {"STACKCHAN_KOKORO_VOICE"})
+    monkeypatch.setenv("STACKCHAN_KOKORO_VOICE", "bm_fable")
+    monkeypatch.setenv("STACKCHAN_FROM_SHELL", "kept")
+    app.start_gateway({"STACKCHAN_LAUNCHER_PID": "1"})
+    assert "STACKCHAN_KOKORO_VOICE" not in seen["env"]
+    assert seen["env"]["STACKCHAN_FROM_SHELL"] == "kept"
+    assert seen["env"]["STACKCHAN_LAUNCHER_PID"] == "1"
