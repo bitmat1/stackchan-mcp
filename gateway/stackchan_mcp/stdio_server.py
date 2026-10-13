@@ -21,7 +21,11 @@ from mcp.types import ImageContent, Notification, TextContent, Tool
 
 from . import __version__
 from .gateway import get_gateway
+from .faces import available_faces
+from .gestures import GESTURE_NAMES
+from .head_limits import pitch_max, pitch_mid, pitch_min
 from .notify_config import NotifyConfig, load_notify_config
+from .voice_channel import voice_channel_enabled
 from .user_defaults import resolve_default
 from .stt import listen_and_transcribe
 from .tts import synthesize_and_send
@@ -58,6 +62,17 @@ STACKCHAN_CHANNEL_INSTRUCTIONS = (
     '<channel source="plugin:stackchanmcp:stackchanmcp" action="..." '
     'subtype="..." duration_ms="...">. React naturally using existing '
     'tools (set_avatar, say, set_mouth, set_leds, move_head).'
+)
+STACKCHAN_VOICE_INSTRUCTIONS = (
+    'The user talks to you through the Stack-chan robot. Their speech '
+    'arrives as Channels notifications with event_type="voice" (transcribed '
+    'locally, so expect occasional mis-hearings). They are listening, not '
+    'reading: always answer by calling say() with a short, natural spoken '
+    'reply, and set a matching expression with set_avatar (or an emoji in '
+    'the say text) and an occasional head gesture with gesture() or '
+    'move_head. Keep '
+    'replies to a few sentences, with no markdown, lists or code. Use '
+    'take_photo when asked what the robot can see.'
 )
 STACKCHAN_JSONL_INSTRUCTIONS = (
     "Stack-chan physical events are persisted to the JSONL log; host "
@@ -290,13 +305,15 @@ def _build_experimental_capabilities(
     capabilities: dict[str, dict[str, Any]] = {}
     if notify_config.legacy_event_enabled:
         capabilities[STACKCHAN_EVENT_METHOD] = {}
-    if notify_config.channels_enabled:
+    if notify_config.channels_enabled or voice_channel_enabled():
         capabilities[CHANNEL_CAPABILITY] = {}
     return capabilities
 
 
 def _build_stackchan_event_instructions(notify_config: NotifyConfig) -> str | None:
     fragments = []
+    if voice_channel_enabled():
+        fragments.append(STACKCHAN_VOICE_INSTRUCTIONS)
     if notify_config.channels_enabled:
         fragments.append(STACKCHAN_CHANNEL_INSTRUCTIONS)
     if notify_config.legacy_event_enabled:
@@ -532,9 +549,11 @@ async def _handle_follow_pose_stream(
     )
     if (
         not _is_int_arg(pitch_center_deg)
-        or not 5 <= pitch_center_deg <= 85
+        or not pitch_min() <= pitch_center_deg <= pitch_max()
     ):
-        return _follow_pose_error("pitch_center_deg must be an integer in 5..85")
+        return _follow_pose_error(
+            f"pitch_center_deg must be an integer in {pitch_min()}..{pitch_max()}"
+        )
 
     smoothing_window = (
         arguments["smoothing_window"]
@@ -842,6 +861,36 @@ async def _dispatch_mcp_tool(
     arguments: dict[str, Any],
     gateway: Any,
 ) -> list[TextContent | ImageContent]:
+    """Run one StackChan MCP tool, recording it in the activity feed."""
+    from . import activity
+
+    if name == "say":
+        activity.record("said", arguments.get("text", ""))
+    elif name != "get_status":
+        activity.record_tool(name, arguments)
+    try:
+        content = await _dispatch_mcp_tool_inner(name, arguments, gateway)
+    except Exception as exc:
+        activity.record("error", f"{name}: {exc}")
+        raise
+    first = next((c.text for c in content if isinstance(c, TextContent)), "")
+    if first.startswith('{"error"') or first.startswith('{\n  "error"'):
+        activity.record("error", f"{name}: {first}")
+    elif name == "listen":
+        try:
+            heard = json.loads(first).get("text", "")
+        except (ValueError, AttributeError):
+            heard = ""
+        if heard:
+            activity.record("heard", heard, source="mic")
+    return content
+
+
+async def _dispatch_mcp_tool_inner(
+    name: str,
+    arguments: dict[str, Any],
+    gateway: Any,
+) -> list[TextContent | ImageContent]:
     """Run one StackChan MCP tool against the provided gateway instance."""
     if name == "get_status":
         status = gateway.esp32.get_status()
@@ -869,6 +918,49 @@ async def _dispatch_mcp_tool(
                     text=json.dumps({"error": str(exc)}),
                 )
             ]
+        return [TextContent(type="text", text=json.dumps(result))]
+
+    if name == "show_image":
+        source = arguments.get("image", "")
+        if not isinstance(source, str) or not source:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": "image is required"}))]
+        result = await gateway.show_image(
+            source,
+            seconds=int(arguments.get("seconds", 10)),
+            fit=str(arguments.get("fit", "fit")),
+        )
+        return [TextContent(type="text", text=json.dumps(result, default=str))]
+
+    if name == "show_gif":
+        source = arguments.get("image", "")
+        if not isinstance(source, str) or not source:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": "image is required"}))]
+        result = await gateway.show_gif(
+            source,
+            seconds=int(arguments.get("seconds", 15)),
+            loops=int(arguments.get("loops", 0)),
+            fit=str(arguments.get("fit", "fit")),
+            fast=bool(arguments.get("fast", False)),
+        )
+        return [TextContent(type="text", text=json.dumps(result, default=str))]
+
+    if name == "set_subtitles":
+        from .subtitles import set_subtitles_enabled, subtitles_enabled
+
+        set_subtitles_enabled(bool(arguments.get("enabled", True)))
+        return [TextContent(type="text", text=json.dumps({"ok": True, "enabled": subtitles_enabled()}))]
+
+    if name == "gesture":
+        from .gestures import run_gesture
+
+        try:
+            result = await run_gesture(
+                gateway,
+                str(arguments.get("name", "")),
+                float(arguments.get("intensity", 1.0)),
+            )
+        except (ValueError, RuntimeError) as exc:
+            result = {"ok": False, "error": str(exc)}
         return [TextContent(type="text", text=json.dumps(result))]
 
     if name == "load_avatar_set":
@@ -952,7 +1044,7 @@ async def _dispatch_mcp_tool(
         if (
             not isinstance(pitch_val, int)
             or isinstance(pitch_val, bool)
-            or not (5 <= pitch_val <= 85)
+            or not (pitch_min() <= pitch_val <= pitch_max())
         ):
             return [
                 TextContent(
@@ -960,10 +1052,8 @@ async def _dispatch_mcp_tool(
                     text=json.dumps(
                         {
                             "error": (
-                                "pitch must be an integer in 5..85 "
-                                "(M5Stack-recommended operating range; "
-                                "for the wider firmware hard clamp "
-                                "0..88 use `set_head_angles`). got "
+                                f"pitch must be an integer in {pitch_min()}..{pitch_max()} "
+                                "(this robot's head range). got "
                                 f"{pitch_val!r}"
                             )
                         }
@@ -1098,6 +1188,46 @@ async def _dispatch_mcp_tool(
             "self.display.set_blink",
             arguments,
         ),
+        "show_text": (
+            "self.display.show_text",
+            arguments,
+        ),
+        "ticker": (
+            "self.display.set_ticker",
+            arguments,
+        ),
+        "set_face_animation": (
+            "self.display.set_animation",
+            arguments,
+        ),
+        "get_face_stats": (
+            "self.display.get_face_stats",
+            {},
+        ),
+        "set_lcd_refresh": (
+            "self.display.set_lcd_refresh",
+            arguments,
+        ),
+        "get_task_stats": (
+            "self.system.get_task_stats",
+            {},
+        ),
+        "set_wake_word": (
+            "self.audio.set_wake_word",
+            arguments,
+        ),
+        "set_face_style": (
+            "self.display.set_face_style",
+            arguments,
+        ),
+        "clear_screen_overlay": (
+            "self.display.clear_overlay",
+            {},
+        ),
+        "set_gaze": (
+            "self.display.set_gaze",
+            arguments,
+        ),
         "set_servo_torque": (
             "self.robot.set_servo_torque",
             arguments,
@@ -1108,6 +1238,14 @@ async def _dispatch_mcp_tool(
         ),
         "get_touch_state": (
             "self.touch.get_touch_state",
+            {},
+        ),
+        "get_motion": (
+            "self.sensors.get_motion",
+            {},
+        ),
+        "get_proximity": (
+            "self.sensors.get_proximity",
             {},
         ),
         "set_led": (
@@ -1398,13 +1536,10 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                 name="move_head",
                 description=(
                     "Move the robot's head to safe, recommended angles. "
-                    "yaw: horizontal (-90 to 90), pitch: vertical (5 to 85, "
-                    "the M5Stack-recommended operating range). Out-of-range "
-                    "requests are rejected at this MCP layer; for advanced "
-                    "callers that need the firmware hard clamp (pitch 0..88), "
-                    "use the firmware-side `set_head_angles` device tool, "
-                    "which exposes a permissive schema and the authoritative "
-                    "two-tier guard described in the README."
+                    "yaw: horizontal (-90 to 90; positive turns to the "
+                    f"robot's left), pitch: vertical ({pitch_min()} to "
+                    f"{pitch_max()}; higher looks further up). Out-of-range "
+                    "requests are rejected."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1418,13 +1553,11 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         "pitch": {
                             "type": "integer",
                             "description": (
-                                "Vertical angle in degrees (5 to 85, "
-                                "M5Stack-recommended operating range). For the "
-                                "wider firmware hard clamp (0..88), use the "
-                                "`set_head_angles` device tool instead."
+                                f"Vertical angle in degrees ({pitch_min()} to "
+                                f"{pitch_max()}); higher looks further up."
                             ),
-                            "minimum": 5,
-                            "maximum": 85,
+                            "minimum": pitch_min(),
+                            "maximum": pitch_max(),
                         },
                         "speed": {
                             "oneOf": [
@@ -1449,7 +1582,7 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                     "forwarded 1:1 and clamped to +/-90 degrees; sensor "
                     "pitch is shifted by pitch_center_deg (default 45) so "
                     "sensor neutral maps to head neutral, then clamped to "
-                    "5..85 degrees. Inputs beyond the head's mechanical range "
+                    f"{pitch_min()}..{pitch_max()} degrees. Inputs beyond the head's mechanical range "
                     "saturate at the limit without scaling. The subscriber "
                     "applies moving-average smoothing, a downsample cap, and "
                     "an angular-velocity clamp. Only one subscription is "
@@ -1505,9 +1638,9 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         },
                         "pitch_center_deg": {
                             "type": "integer",
-                            "default": 45,
-                            "minimum": 5,
-                            "maximum": 85,
+                            "default": pitch_mid(),
+                            "minimum": pitch_min(),
+                            "maximum": pitch_max(),
                             "description": (
                                 "Servo pitch (deg) treated as the sensor-pitch=0 "
                                 "anchor. Defaults to the head's neutral pose."
@@ -1803,7 +1936,9 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                 description=(
                     "Switch the avatar face shown on the LCD. "
                     "Choose one of the supported faces; this is the robot's "
-                    "actual visible expression, not just a label. "
+                    "actual visible expression, not just a label. Pick the "
+                    "face that fits the moment (e.g. confused when unsure, "
+                    "laughing at a joke, sleepy late at night). "
                     "Pass 'off' to hide the avatar and disable blink, exposing the "
                     "underlying xiaozhi-esp32 screens (WiFi config UI, OTA, settings); "
                     "any other face brings the avatar back and restores blink."
@@ -1813,18 +1948,9 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                     "properties": {
                         "face": {
                             "type": "string",
-                            "enum": [
-                                "idle",
-                                "happy",
-                                "thinking",
-                                "sad",
-                                "surprised",
-                                "embarrassed",
-                                "off",
-                            ],
+                            "enum": [*available_faces(), "off"],
                             "description": (
-                                "One of: idle, happy, thinking, sad, surprised, "
-                                "embarrassed, off."
+                                "One of: " + ", ".join(available_faces()) + ", off."
                             ),
                         },
                     },
@@ -1912,6 +2038,200 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         },
                     },
                     "required": ["steps"],
+                },
+            ),
+            Tool(
+                name="show_image",
+                description=(
+                    "Show a picture full-screen on the robot, above its face, "
+                    "for `seconds` (0 = until someone taps the screen; a tap "
+                    "always dismisses it). `image` is a file path on this "
+                    "computer, an http(s) URL, or base64 / data: URL. The "
+                    "gateway scales it to the 320x240 screen."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "image": {"type": "string", "description": "File path, http(s) URL or base64 image data."},
+                        "seconds": {"type": "integer", "minimum": 0, "maximum": 3600, "default": 10},
+                        "fit": {
+                            "type": "string",
+                            "enum": ["fit", "fill"],
+                            "default": "fit",
+                            "description": "fit = whole picture with black bars; fill = cover the screen and crop.",
+                        },
+                    },
+                    "required": ["image"],
+                },
+            ),
+            Tool(
+                name="show_gif",
+                description=(
+                    "Play an animated GIF full-screen on the robot, above its "
+                    "face. `image` is a file path on this computer, an http(s) "
+                    "URL, or base64 / data: URL. The gateway scales it to the "
+                    "320x240 screen; the robot plays it from memory at the "
+                    "GIF's own speed (or flat out with fast=true) for `seconds` "
+                    "(0 = no time limit) or `loops` times (0 = keep looping). "
+                    "A tap on the screen or clear_screen_overlay stops it."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "image": {"type": "string", "description": "File path, http(s) URL or base64 GIF data."},
+                        "seconds": {"type": "integer", "minimum": 0, "maximum": 3600, "default": 15},
+                        "loops": {"type": "integer", "minimum": 0, "maximum": 1000, "default": 0},
+                        "fit": {
+                            "type": "string",
+                            "enum": ["fit", "fill"],
+                            "default": "fit",
+                            "description": "fit = whole animation with black bars; fill = cover the screen and crop.",
+                        },
+                        "fast": {
+                            "type": "boolean",
+                            "default": False,
+                            "description": "Ignore the GIF's frame delays and play as fast as the robot can.",
+                        },
+                    },
+                    "required": ["image"],
+                },
+            ),
+            Tool(
+                name="show_text",
+                description=(
+                    "Show a caption on the robot's screen above its face, e.g. "
+                    "a short answer, a timer, a name or a link. Hides after "
+                    "`seconds` (0 = until the screen is tapped)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "seconds": {"type": "integer", "minimum": 0, "maximum": 3600, "default": 10},
+                        "position": {"type": "string", "enum": ["bottom", "center", "top"], "default": "bottom"},
+                    },
+                    "required": ["text"],
+                },
+            ),
+            Tool(
+                name="ticker",
+                description=(
+                    "Scroll text along the bottom of the robot's screen like a "
+                    "news ticker, e.g. headlines, reminders or status updates. "
+                    "It loops until replaced or cleared (pass empty text), or "
+                    "for `seconds` when > 0. Spoken replies show as subtitles "
+                    "in the same strip and the ticker resumes afterwards."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "Text to scroll; empty clears the ticker."},
+                        "seconds": {"type": "integer", "minimum": 0, "maximum": 86400, "default": 0},
+                        "speed": {"type": "integer", "minimum": 10, "maximum": 400, "default": 60,
+                                  "description": "Scroll speed in pixels per second."},
+                    },
+                    "required": ["text"],
+                },
+            ),
+            Tool(
+                name="set_face_animation",
+                description="Diagnostics: face animation period in ms (0 = no timed animation).",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"interval_ms": {"type": "integer", "minimum": 0, "maximum": 5000}},
+                    "required": ["interval_ms"],
+                },
+            ),
+            Tool(
+                name="get_face_stats",
+                description="Diagnostics: face draw timing since the last call (then resets).",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="set_lcd_refresh",
+                description="Diagnostics: enable/disable the periodic LCD state re-send.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean"}},
+                    "required": ["enabled"],
+                },
+            ),
+            Tool(
+                name="get_task_stats",
+                description="Diagnostics: per-task CPU use on the robot over 2 s.",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="set_wake_word",
+                description="Diagnostics: turn wake-word detection on/off (until the next state change).",
+                inputSchema={"type": "object", "properties": {"enabled": {"type": "boolean"}}, "required": ["enabled"]},
+            ),
+            Tool(
+                name="set_subtitles",
+                description="Turn the subtitles shown while the robot speaks on or off.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean"}},
+                    "required": ["enabled"],
+                },
+            ),
+            Tool(
+                name="set_face_style",
+                description=(
+                    "Switch the robot's face look: 'stackchan' (classic white "
+                    "dot eyes) or 'bender' (visor, round eyes, grille mouth). "
+                    "All expressions work in both. Saved on the robot."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {"style": {"type": "string", "enum": ["stackchan", "bender"]}},
+                    "required": ["style"],
+                },
+            ),
+            Tool(
+                name="clear_screen_overlay",
+                description="Hide any picture, caption or GIF shown with show_image / show_text / show_gif.",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="set_gaze",
+                description=(
+                    "Point the face's eyes without moving the head, e.g. to "
+                    "glance at someone or look up while thinking. x and y "
+                    "are -100..100 (x negative = screen left, y negative = "
+                    "up); 0,0 looks straight ahead. Needs the RT firmware's "
+                    "drawn face."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "integer", "minimum": -100, "maximum": 100},
+                        "y": {"type": "integer", "minimum": -100, "maximum": 100},
+                    },
+                    "required": ["x", "y"],
+                },
+            ),
+            Tool(
+                name="gesture",
+                description=(
+                    "Play a short head gesture: nod (yes), shake (no), tilt "
+                    "(curious), look_around, look_up, bow, wiggle (happy), "
+                    "think, sigh or startle. The head returns to where it "
+                    "started. Use alongside say() to make replies lively."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "enum": list(GESTURE_NAMES)},
+                        "intensity": {
+                            "type": "number",
+                            "minimum": 0.2,
+                            "maximum": 2.0,
+                            "default": 1.0,
+                            "description": "Scales how far the head moves.",
+                        },
+                    },
+                    "required": ["name"],
                 },
             ),
             Tool(
@@ -2008,6 +2328,32 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                     "Read the head-touch (Si12T) sensor state and the most recent "
                     "gesture event (tap/stroke/idle). Returns per-zone booleans, "
                     "the raw output byte, and how long ago the last event fired."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+            Tool(
+                name="get_motion",
+                description=(
+                    "Read the robot's motion sensor (BMI270 IMU): acceleration in g, "
+                    "rotation in deg/s, and whether it is currently being held. "
+                    "Being picked up, put down, tipped over or shaken also arrives "
+                    "as an imu event on its own."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {},
+                },
+            ),
+            Tool(
+                name="get_proximity",
+                description=(
+                    "Read the proximity sensor above the screen (LTR-553): raw "
+                    "proximity (0-2047, bigger = closer) and whether something is "
+                    "near the face. Someone approaching or leaving also arrives as "
+                    "a proximity event on its own."
                 ),
                 inputSchema={
                     "type": "object",
@@ -2466,7 +2812,7 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                                 "Capture window in milliseconds. Clamped to "
                                 "[100, 30000]."
                             ),
-                            "default": 5000,
+                            "default": 3000,
                             "minimum": 100,
                             "maximum": 30000,
                         },
@@ -2512,11 +2858,11 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                             "type": "number",
                             "description": (
                                 "Pitch angle for motion='look-up'. Must be "
-                                "between 5 and 85 degrees."
+                                f"between {pitch_min()} and {pitch_max()} degrees."
                             ),
-                            "default": 50.0,
-                            "minimum": 5,
-                            "maximum": 85,
+                            "default": float(pitch_max()),
+                            "minimum": pitch_min(),
+                            "maximum": pitch_max(),
                         },
                     },
                 },

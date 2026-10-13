@@ -1450,3 +1450,33 @@ async def test_device_driven_listen_cleanup_on_disconnect(manager_with_hook):
     assert not is_recording(), "recording slot was leaked across connections"
     # No push should have fired for the aborted capture.
     assert calls == []
+
+
+class _FakeWs:
+    def __init__(self, local_address):
+        self.local_address = local_address
+
+
+class _FakeConn:
+    def __init__(self, local_address):
+        self._ws = _FakeWs(local_address)
+
+
+@pytest.mark.parametrize(
+    ("address", "expected"),
+    [
+        (("192.0.2.67", 8765), "192.0.2.67"),
+        (("::ffff:192.0.2.67", 8765, 0, 0), "192.0.2.67"),
+        (("127.0.0.1", 8765), None),
+        (None, None),
+    ],
+)
+def test_facing_host(address, expected):
+    assert esp32_client._facing_host(_FakeConn(address)) == expected
+
+
+def test_with_host_keeps_port_and_path():
+    assert (
+        esp32_client._with_host("http://192.0.2.10:8766/capture", "192.0.2.67")
+        == "http://192.0.2.67:8766/capture"
+    )

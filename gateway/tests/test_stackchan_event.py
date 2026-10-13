@@ -108,6 +108,74 @@ async def test_stackchan_event_malformed_frame_warns_without_notify(
     assert f"Malformed stackchan-event frame: {warning}" in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("event_type", "subtype", "action"),
+    [
+        ("imu", "picked_up", "picked_up"),
+        ("imu", "put_down", "put_down"),
+        ("imu", "tipped_over", "tipped_over"),
+        ("imu", "shake", "shaken"),
+        ("proximity", "near", "someone_near"),
+        ("proximity", "far", "someone_left"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_body_sensor_events_are_forwarded(monkeypatch, event_type, subtype, action):
+    calls = []
+
+    async def fake_notify(method, params):
+        calls.append((method, params))
+
+    monkeypatch.setattr(stdio_server, "notify_stackchan_event", fake_notify)
+    manager = ESP32Manager(notify_config=_notify_config(legacy=True))
+
+    await manager._emit_stackchan_event(
+        {
+            "session_id": "session-1",
+            "type": "stackchan-event",
+            "event_type": event_type,
+            "subtype": subtype,
+            "duration_ms": 1200,
+            "ts": 123456,
+        }
+    )
+
+    assert len(calls) == 1
+    method, params = calls[0]
+    assert method == STACKCHAN_EVENT_METHOD
+    assert (params["event_type"], params["subtype"], params["action"]) == (
+        event_type,
+        subtype,
+        action,
+    )
+
+
+@pytest.mark.asyncio
+async def test_unknown_subtype_of_known_event_type_is_rejected(monkeypatch, caplog):
+    calls = []
+
+    async def fake_notify(method, params):
+        calls.append((method, params))
+
+    monkeypatch.setattr(stdio_server, "notify_stackchan_event", fake_notify)
+    manager = ESP32Manager(notify_config=_notify_config(legacy=True))
+
+    with caplog.at_level(logging.WARNING):
+        await manager._emit_stackchan_event(
+            {
+                "session_id": "session-1",
+                "type": "stackchan-event",
+                "event_type": "imu",
+                "subtype": "tap",
+                "duration_ms": 0,
+                "ts": 1,
+            }
+        )
+
+    assert calls == []
+    assert "Malformed stackchan-event frame: subtype='tap'" in caplog.text
+
+
 def test_stackchan_event_capability_and_instructions_are_declared():
     server = create_server()
     options = _create_initialization_options(

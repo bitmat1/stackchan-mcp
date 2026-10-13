@@ -14,12 +14,15 @@ import os
 import time
 import uuid
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import websockets
 import websockets.exceptions
 from websockets.asyncio.server import ServerConnection
 
+from . import activity
 from .audio_input_hook import push_audio_capture
+from .voice_channel import transcribe_and_notify, voice_channel_enabled
 from .audio_stream import (
     handle_audio_frame,
     is_recording,
@@ -60,6 +63,29 @@ _TOOL_LANES = {
     "self.touch.": "touch",
     "self.get_device_status": "status",
 }
+
+
+def _facing_host(connection: "ESP32Connection") -> str | None:
+    """This machine's IP as reached by ``connection``, or None if unknown."""
+    try:
+        address = connection._ws.local_address
+    except Exception:
+        return None
+    if not address:
+        return None
+    host = str(address[0])
+    if host.startswith("::ffff:"):
+        host = host[len("::ffff:") :]
+    if host in {"0.0.0.0", "::", "127.0.0.1", "::1"}:
+        return None
+    return host
+
+
+def _with_host(url: str, host: str) -> str:
+    """Return ``url`` with its host replaced, keeping scheme, port and path."""
+    parts = urlsplit(url)
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    return urlunsplit(parts._replace(netloc=netloc))
 
 
 def _hardware_lane(tool_name: str) -> str:
@@ -107,6 +133,7 @@ def _log_disconnect_details(
     last_frame_received_at: float | None,
 ) -> None:
     disconnected_at = _monotonic()
+    activity.record("system", f"robot disconnected ({close_class})", source="robot")
     logger.info(
         "ESP32 disconnected: device=%s close_class=%s "
         "rcvd_code=%s rcvd_reason=%r sent_code=%s sent_reason=%r "
@@ -528,6 +555,17 @@ class ESP32Manager:
         return self._connection is not None and self._connection.connected
 
     @property
+    def device_facing_host(self) -> str | None:
+        """This machine's IP on the robot's live WebSocket, if connected.
+
+        The robot reached the gateway on that address, so it can reach the
+        capture server there too, even after a DHCP change.
+        """
+        if not self.device_connected:
+            return None
+        return _facing_host(self._connection)
+
+    @property
     def connection(self) -> ESP32Connection | None:
         return self._connection
 
@@ -632,6 +670,7 @@ class ESP32Manager:
             ws.request.headers.get("Device-Id", "unknown") if ws.request else "unknown"
         )
         logger.info("ESP32 connecting: device=%s", device_id)
+        activity.record("system", "robot connected", source="robot")
 
         connection = ESP32Connection(ws, session_id)
         connection.device_id = device_id
@@ -737,7 +776,7 @@ class ESP32Manager:
                     # forwarding pipeline.
                     state = data.get("state", "")
                     if state == "start":
-                        if not self._audio_hook_url:
+                        if not self._audio_hook_url and not voice_channel_enabled():
                             logger.debug(
                                 "device-driven listen.start session=%s "
                                 "ignored (STACKCHAN_AUDIO_HOOK_URL not "
@@ -775,14 +814,23 @@ class ESP32Manager:
                             # round-trip. The task is fire-and-forget;
                             # failures are logged inside
                             # push_audio_capture and do not propagate.
-                            asyncio.create_task(
-                                push_audio_capture(
-                                    self._audio_hook_url,
-                                    self._audio_hook_token,
-                                    frames,
-                                    session_id=session_id,
+                            if self._audio_hook_url:
+                                asyncio.create_task(
+                                    push_audio_capture(
+                                        self._audio_hook_url,
+                                        self._audio_hook_token,
+                                        frames,
+                                        session_id=session_id,
+                                    )
                                 )
-                            )
+                            # Local STT -> Claude Code channel message
+                            # (see :mod:`stackchan_mcp.voice_channel`).
+                            if voice_channel_enabled():
+                                asyncio.create_task(
+                                    transcribe_and_notify(
+                                        frames, session_id=session_id
+                                    )
+                                )
                     else:
                         logger.debug(
                             "listen message with unknown state=%r "
@@ -856,8 +904,14 @@ class ESP32Manager:
 
     async def _init_device(self, connection: ESP32Connection, device_id: str) -> None:
         """Initialize MCP session with a newly connected device."""
+        vision_url = self._vision_url
+        facing = _facing_host(connection)
+        # VISION_URL (remote access) is used as given; a LAN capture URL
+        # follows the address this robot actually reached us on.
+        if vision_url and facing and not os.getenv("VISION_URL"):
+            vision_url = _with_host(vision_url, facing)
         if await connection.initialize(
-            vision_url=self._vision_url,
+            vision_url=vision_url,
             vision_token=self._vision_token,
         ):
             await connection.discover_tools()
@@ -912,10 +966,13 @@ class ESP32Manager:
         ts = payload.get("ts")
         session_id = payload.get("session_id")
 
-        if event_type != "touch":
+        config = self._notify_config
+        # Every (event_type, subtype) the firmware sends has a template.
+        known = config.messages.keys() | DEFAULT_MESSAGE_TEMPLATES.keys()
+        if event_type not in {known_type for known_type, _ in known}:
             logger.warning("Malformed stackchan-event frame: event_type=%r", event_type)
             return
-        if subtype not in {"tap", "stroke"}:
+        if (event_type, subtype) not in known:
             logger.warning("Malformed stackchan-event frame: subtype=%r", subtype)
             return
         if (
@@ -935,10 +992,12 @@ class ESP32Manager:
             logger.warning("Malformed stackchan-event frame: session_id=%r", session_id)
             return
 
-        config = self._notify_config
         message = config.messages.get(
             (event_type, subtype),
             DEFAULT_MESSAGE_TEMPLATES[(event_type, subtype)],
+        )
+        activity.record(
+            "event", render_template(message.template, {"duration_ms": duration_ms}), source="robot"
         )
         ts_unix = time.time()
         event_payload = {

@@ -7,6 +7,7 @@ This module orchestrates both sides.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -54,7 +55,9 @@ class Gateway:
         if explicit_url:
             return explicit_url
 
-        host = os.getenv("VISION_HOST")
+        # The address the robot's WebSocket arrived on beats a configured
+        # VISION_HOST, which goes stale when DHCP hands the Mac a new IP.
+        host = self.esp32.device_facing_host or os.getenv("VISION_HOST")
         if not host:
             logger.warning(
                 "VISION_URL/VISION_HOST not set; defaulting to 127.0.0.1. "
@@ -170,6 +173,10 @@ class Gateway:
         else:
             self._mdns_advertiser = None
 
+        from .link_status import run_link_status_reporter
+
+        self._link_status_task = asyncio.create_task(run_link_status_reporter(self))
+
         self._running = True
         logger.info(
             "Gateway started: WS on %s:%d, capture on %s:%d, vision_url=%s",
@@ -204,6 +211,11 @@ class Gateway:
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("beat mode shutdown failed: %s", exc)
+
+        link_task = getattr(self, "_link_status_task", None)
+        if link_task is not None:
+            link_task.cancel()
+            self._link_status_task = None
 
         self._running = False
         if self._mdns_advertiser:
@@ -289,6 +301,66 @@ class Gateway:
         result.setdefault("checksum", sha256)
         result["bytes_transferred"] = len(payload) if result.get("ok") else 0
         return result
+
+
+    async def show_image(self, source: str, seconds: int = 10, fit: str = "fit") -> dict:
+        """Convert ``source`` to a 320x240 frame and have the robot show it.
+
+        The frame is staged on the capture server for one authenticated
+        download, like avatar sets, and the device fetches it over Wi-Fi.
+        """
+        from .screen_image import SCREEN_BYTES, load_image_bytes, to_rgb565
+
+        if self._capture_app is None:
+            return {"ok": False, "error": "gateway_not_started"}
+        try:
+            encoded = await load_image_bytes(source)
+            frame = await asyncio.to_thread(to_rgb565, encoded, "fill" if fit == "fill" else "fit")
+        except (ValueError, OSError, RuntimeError) as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:  # Pillow raises its own UnidentifiedImageError
+            return {"ok": False, "error": f"could not read image: {exc}"}
+
+        short_id, token, _sha256 = await stage_avatar_set(self._capture_app, "image", frame)
+        url = f"{self.avatar_set_base_url}/avatar_set/{short_id}"
+        result, error = await self.esp32.call_tool(
+            "self.display.show_image",
+            {"url": url, "token": token, "seconds": int(seconds)},
+        )
+        if error:
+            return {"ok": False, "error": error.get("message", str(error))}
+        return {"ok": True, "bytes": SCREEN_BYTES, "seconds": int(seconds), "device": result}
+
+
+    async def show_gif(
+        self, source: str, seconds: int = 15, loops: int = 0, fit: str = "fit", fast: bool = False
+    ) -> dict:
+        """Prepare an animated GIF for the 320x240 screen and have the robot play it.
+
+        Staged on the capture server for one authenticated download, like
+        show_image; the robot keeps it in PSRAM and plays it full screen.
+        """
+        from .screen_image import load_image_bytes, prepare_gif
+
+        if self._capture_app is None:
+            return {"ok": False, "error": "gateway_not_started"}
+        try:
+            encoded = await load_image_bytes(source)
+            gif, info = await asyncio.to_thread(prepare_gif, encoded, "fill" if fit == "fill" else "fit")
+        except (ValueError, OSError, RuntimeError) as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:  # Pillow raises its own UnidentifiedImageError
+            return {"ok": False, "error": f"could not read GIF: {exc}"}
+
+        short_id, token, _sha256 = await stage_avatar_set(self._capture_app, "gif", gif)
+        url = f"{self.avatar_set_base_url}/avatar_set/{short_id}"
+        result, error = await self.esp32.call_tool(
+            "self.display.show_gif",
+            {"url": url, "token": token, "seconds": int(seconds), "loops": int(loops), "fast": bool(fast)},
+        )
+        if error:
+            return {"ok": False, "error": error.get("message", str(error))}
+        return {"ok": True, "bytes": len(gif), **info, "seconds": int(seconds), "device": result}
 
 
 # Singleton gateway instance, shared between stdio server and ESP32 manager

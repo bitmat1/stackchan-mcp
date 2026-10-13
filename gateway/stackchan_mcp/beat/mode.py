@@ -16,6 +16,7 @@ import threading
 from typing import Any
 import wave
 
+from ..head_limits import pitch_max, pitch_mid, pitch_min
 from ..audio_stream import (
     is_recording,
     recording_owner,
@@ -38,7 +39,6 @@ LISTEN_RESTART_INITIAL_BACKOFF_S = 1.0
 LISTEN_RESTART_MAX_BACKOFF_S = 8.0
 MIN_MOTION_CONFIDENCE = 0.35
 SERVO_YAW_MIN, SERVO_YAW_MAX = -90, 90
-SERVO_PITCH_MIN, SERVO_PITCH_MAX = 5, 85
 DEFAULT_SENSITIVITY = 0.5
 MIN_ONSET_RMS_LEAST_SENSITIVE = 0.025
 MIN_ONSET_RMS_DEFAULT = 0.004
@@ -713,7 +713,7 @@ class BeatMode:
     async def _send_motion(self, side: int, cfg: BeatModeConfig) -> None:
         intensity = cfg.motion_intensity
         yaw = int(round(_clamp(side * 14.0 * intensity, SERVO_YAW_MIN, SERVO_YAW_MAX)))
-        pitch = int(round(_clamp(45.0 + 4.0 * intensity, SERVO_PITCH_MIN, SERVO_PITCH_MAX)))
+        pitch = int(round(_clamp(pitch_mid() + 4.0 * intensity, pitch_min(), pitch_max())))
         speed_dps = int(round(_clamp(120.0 + 120.0 * intensity, 1.0, 240.0)))
         ok = await self._call_tool(
             "self.robot.set_head_angles",

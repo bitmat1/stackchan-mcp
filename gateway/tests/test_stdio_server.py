@@ -1121,8 +1121,10 @@ async def test_ws2812_init_rejects_invalid_color_order(monkeypatch, port):
 
 
 @pytest.mark.asyncio
-async def test_list_tools_move_head_declares_recommended_pitch_range():
-    """move_head schema mirrors M5Stack-recommended 5..85 / yaw -90..90."""
+async def test_list_tools_move_head_declares_recommended_pitch_range(monkeypatch):
+    """move_head schema defaults to the kit's 5..85 / yaw -90..90."""
+    monkeypatch.delenv("STACKCHAN_PITCH_MIN", raising=False)
+    monkeypatch.delenv("STACKCHAN_PITCH_MAX", raising=False)
     server = create_server()
 
     result = await server.request_handlers[ListToolsRequest](
@@ -1139,10 +1141,6 @@ async def test_list_tools_move_head_declares_recommended_pitch_range():
     yaw_schema = tool.inputSchema["properties"]["yaw"]
     assert yaw_schema["minimum"] == -90
     assert yaw_schema["maximum"] == 90
-
-    # The description should mention the escape-hatch tool name so an LLM
-    # reading it can pick the right alternative for permissive use cases.
-    assert "set_head_angles" in tool.description
 
     speed_schema = tool.inputSchema["properties"]["speed"]
     assert speed_schema["oneOf"] == [
@@ -2040,3 +2038,17 @@ async def test_follow_led_rejects_bad_color_order(monkeypatch):
     assert captured == []
     assert "Input validation error" in result.root.content[0].text
     assert "'bgr' is not one of ['grb', 'rgb']" in result.root.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_move_head_pitch_range_follows_env(monkeypatch):
+    """STACKCHAN_PITCH_MIN/MAX set the advertised and enforced range."""
+    monkeypatch.setenv("STACKCHAN_PITCH_MIN", "50")
+    monkeypatch.setenv("STACKCHAN_PITCH_MAX", "90")
+    server = create_server()
+    result = await server.request_handlers[ListToolsRequest](
+        ListToolsRequest(method="tools/list")
+    )
+    tool = next(t for t in result.root.tools if t.name == "move_head")
+    assert tool.inputSchema["properties"]["pitch"]["minimum"] == 50
+    assert tool.inputSchema["properties"]["pitch"]["maximum"] == 90

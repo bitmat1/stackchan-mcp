@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 import websockets
 
+from .head_limits import pitch_max, pitch_min
 from .wifi_power_save import (
     WIFI_PS_IDLE_MODE as WIFI_PS_IDLE_MODE,
     WIFI_PS_STREAM_MODE as WIFI_PS_STREAM_MODE,
@@ -21,7 +22,6 @@ from .wifi_power_save import (
 )
 
 SERVO_YAW_MIN, SERVO_YAW_MAX = -90, 90
-SERVO_PITCH_MIN, SERVO_PITCH_MAX = 5, 85
 SERVO_MAX_SPEED_DPS = 240
 
 
@@ -98,8 +98,8 @@ def map_sensor_to_servo(
         round(
             _clamp(
                 pitch_center_deg + sensor_pitch * flip_pitch,
-                SERVO_PITCH_MIN,
-                SERVO_PITCH_MAX,
+                pitch_min(),
+                pitch_max(),
             )
         )
     )
@@ -124,7 +124,7 @@ class FollowPoseStream:
         self._last_error: str | None = None
         self._last_servo_yaw = 0
         self._last_servo_pitch = int(
-            round(_clamp(cfg.pitch_center_deg, SERVO_PITCH_MIN, SERVO_PITCH_MAX))
+            round(_clamp(cfg.pitch_center_deg, pitch_min(), pitch_max()))
         )
         self._initial_pose_seeded = False
         self._last_sent_at: float | None = None
@@ -332,7 +332,7 @@ class FollowPoseStream:
             round(_clamp(float(yaw), SERVO_YAW_MIN, SERVO_YAW_MAX))
         )
         self._last_servo_pitch = int(
-            round(_clamp(float(pitch), SERVO_PITCH_MIN, SERVO_PITCH_MAX))
+            round(_clamp(float(pitch), pitch_min(), pitch_max()))
         )
         self._initial_pose_seeded = True
         return True
@@ -460,7 +460,7 @@ class FollowPoseStream:
                 round(_clamp(stepped_yaw, SERVO_YAW_MIN, SERVO_YAW_MAX))
             )
             servo_pitch = int(
-                round(_clamp(stepped_pitch, SERVO_PITCH_MIN, SERVO_PITCH_MAX))
+                round(_clamp(stepped_pitch, pitch_min(), pitch_max()))
             )
             speed_dps = int(_clamp(self._cfg.speed_dps, 1, SERVO_MAX_SPEED_DPS))
 

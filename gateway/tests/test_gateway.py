@@ -18,6 +18,8 @@ def _patch_gateway_network(monkeypatch: pytest.MonkeyPatch, gw: Gateway) -> list
     calls: list[tuple] = []
 
     class FakeEsp32:
+        device_facing_host = None
+
         def __init__(self) -> None:
             self._server = None
 
@@ -102,6 +104,32 @@ def test_vision_url_uses_lan_host(monkeypatch):
     gw = Gateway()
 
     assert gw.vision_url == "http://192.0.2.10:8766/capture"
+
+
+def test_vision_url_follows_robot_facing_address(monkeypatch):
+    """A stale VISION_HOST loses to the address the robot actually reached."""
+    monkeypatch.delenv("VISION_URL", raising=False)
+    monkeypatch.setenv("VISION_HOST", "192.0.2.10")
+    monkeypatch.setenv("CAPTURE_PORT", "8766")
+
+    gw = Gateway()
+    monkeypatch.setattr(
+        type(gw.esp32), "device_facing_host", property(lambda self: "192.0.2.67")
+    )
+
+    assert gw.vision_url == "http://192.0.2.67:8766/capture"
+    assert gw.avatar_set_base_url == "http://192.0.2.67:8766"
+
+
+def test_explicit_vision_url_beats_robot_facing_address(monkeypatch):
+    monkeypatch.setenv("VISION_URL", "https://stackchan.example.ts.net:8443/capture")
+
+    gw = Gateway()
+    monkeypatch.setattr(
+        type(gw.esp32), "device_facing_host", property(lambda self: "192.0.2.67")
+    )
+
+    assert gw.vision_url == "https://stackchan.example.ts.net:8443/capture"
 
 
 def test_vision_token_prefers_explicit_token(monkeypatch):

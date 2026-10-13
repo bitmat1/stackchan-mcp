@@ -42,6 +42,34 @@ DEFAULT_MESSAGE_TEMPLATES: Final[dict[tuple[str, str], MessageTemplate]] = {
         action="head_stroke",
         template="head was stroked for {duration_ms}ms",
     ),
+    # On-board IMU (firmware body_events.h). duration_ms is how long the
+    # robot was held for put_down / tipped_over, otherwise 0.
+    ("imu", "picked_up"): MessageTemplate(
+        action="picked_up",
+        template="robot was picked up",
+    ),
+    ("imu", "put_down"): MessageTemplate(
+        action="put_down",
+        template="robot was put back down after {duration_ms}ms",
+    ),
+    ("imu", "tipped_over"): MessageTemplate(
+        action="tipped_over",
+        template="robot was put down on its side or tipped over",
+    ),
+    ("imu", "shake"): MessageTemplate(
+        action="shaken",
+        template="robot was shaken",
+    ),
+    # On-board proximity sensor. "near" is sent at most once per 20 s visit;
+    # duration_ms on "far" is how long someone stayed close.
+    ("proximity", "near"): MessageTemplate(
+        action="someone_near",
+        template="someone came close to the robot's face",
+    ),
+    ("proximity", "far"): MessageTemplate(
+        action="someone_left",
+        template="the person moved away after {duration_ms}ms",
+    ),
 }
 
 
