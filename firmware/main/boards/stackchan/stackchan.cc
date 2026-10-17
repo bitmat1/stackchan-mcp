@@ -813,6 +813,14 @@ private:
     std::atomic<bool> overlay_image_loading_{false};
     std::string overlay_image_last_error_;
 
+    // Drawing canvas (self.display.canvas): a 320x240 RGB565 canvas on
+    // lv_layer_top() above the face. Shapes arrive in batches, are drawn
+    // with LVGL's software renderer and stay until canvas_hide,
+    // clear_overlay or a tap. Hiding keeps the drawing for the next batch.
+    static constexpr int kCanvasMaxOps = 256;
+    uint8_t* canvas_buf_ = nullptr;
+    lv_obj_t* canvas_ = nullptr;
+
     // ---- GIF player (self.display.show_gif) ----
     // One persistent task downloads the GIF into PSRAM and plays it through a
     // PSRAM RGB565 frame. Each frame only the rectangle that changed is
@@ -5563,7 +5571,8 @@ private:
         DisplayLockGuard lock(display_);
         bool image = overlay_image_ != nullptr && !lv_obj_has_flag(overlay_image_, LV_OBJ_FLAG_HIDDEN);
         bool text = overlay_text_ != nullptr && !lv_obj_has_flag(overlay_text_, LV_OBJ_FLAG_HIDDEN);
-        return image || text || gif_playing_.load();
+        bool canvas = canvas_ != nullptr && !lv_obj_has_flag(canvas_, LV_OBJ_FLAG_HIDDEN);
+        return image || text || canvas || gif_playing_.load();
     }
 
     // Short-tap hook: hides any overlay and reports whether one was shown,
@@ -5578,6 +5587,7 @@ private:
         if (!IsOverlayVisible()) return false;
         HideOverlayImage();
         HideOverlayText();
+        HideCanvas();
         StopGif();
         ESP_LOGI(TAG, "Overlay dismissed by tap");
         return true;
@@ -5674,6 +5684,199 @@ private:
                         [](void* arg) { static_cast<StackChanBoard*>(arg)->HideOverlayImage(); },
                         seconds);
         ESP_LOGI(TAG, "show_image: shown for %d s (0 = until tap)", seconds);
+    }
+
+    // ---- Drawing canvas (self.display.canvas / canvas_hide) --------------
+
+    // "#rrggbb" (or "rrggbb"); a missing color keeps *out.
+    static bool ParseCanvasColor(const cJSON* item, lv_color_t* out) {
+        if (item == nullptr) return true;
+        if (!cJSON_IsString(item) || item->valuestring == nullptr) return false;
+        const char* s = item->valuestring;
+        if (*s == '#') s++;
+        if (strlen(s) != 6) return false;
+        for (const char* p = s; *p; p++) {
+            if (!isxdigit(static_cast<unsigned char>(*p))) return false;
+        }
+        *out = lv_color_hex(static_cast<uint32_t>(strtoul(s, nullptr, 16)));
+        return true;
+    }
+
+    static int CanvasInt(const cJSON* op, const char* key, int fallback) {
+        const cJSON* v = cJSON_GetObjectItem(op, key);
+        return cJSON_IsNumber(v) ? static_cast<int>(v->valuedouble) : fallback;
+    }
+
+    static bool CanvasBool(const cJSON* op, const char* key) {
+        return cJSON_IsTrue(cJSON_GetObjectItem(op, key));
+    }
+
+    bool EnsureCanvasLocked() {
+        const uint32_t stride = lv_draw_buf_width_to_stride(kOverlayImageW, LV_COLOR_FORMAT_RGB565);
+        if (canvas_buf_ == nullptr) {
+            canvas_buf_ = static_cast<uint8_t*>(heap_caps_aligned_alloc(
+                LV_DRAW_BUF_ALIGN, stride * kOverlayImageH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            if (canvas_buf_ == nullptr) return false;
+        }
+        if (canvas_ == nullptr) {
+            canvas_ = lv_canvas_create(lv_layer_top());
+            if (canvas_ == nullptr) return false;
+            lv_canvas_set_buffer(canvas_, canvas_buf_, kOverlayImageW, kOverlayImageH,
+                                 LV_COLOR_FORMAT_RGB565);
+            lv_obj_center(canvas_);
+            lv_obj_clear_flag(canvas_, LV_OBJ_FLAG_SCROLLABLE);
+            lv_canvas_fill_bg(canvas_, lv_color_black(), LV_OPA_COVER);
+            lv_obj_add_flag(canvas_, LV_OBJ_FLAG_HIDDEN);
+        }
+        return true;
+    }
+
+    void HideCanvas() {
+        if (display_ == nullptr) return;
+        DisplayLockGuard lock(display_);
+        if (canvas_ != nullptr) lv_obj_add_flag(canvas_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Checks one op before anything is drawn, so a bad op leaves the canvas
+    // as it was. Returns "" when the op is valid.
+    static std::string ValidateCanvasOp(const cJSON* op) {
+        if (!cJSON_IsObject(op)) return "not an object";
+        const cJSON* name = cJSON_GetObjectItem(op, "op");
+        if (!cJSON_IsString(name)) return "missing op";
+        const std::string kind = name->valuestring;
+        if (kind != "clear" && kind != "pixel" && kind != "line" && kind != "rect" &&
+            kind != "circle" && kind != "text") {
+            return "unknown op " + kind;
+        }
+        lv_color_t color = lv_color_white();
+        if (!ParseCanvasColor(cJSON_GetObjectItem(op, "color"), &color)) {
+            return "color must be \"#rrggbb\"";
+        }
+        if (kind == "text" && !cJSON_IsString(cJSON_GetObjectItem(op, "text"))) {
+            return "text op needs a text string";
+        }
+        return "";
+    }
+
+    void DrawCanvasOp(lv_layer_t* layer, const cJSON* op, const lv_font_t* font) {
+        const std::string kind = cJSON_GetObjectItem(op, "op")->valuestring;
+        lv_color_t color = kind == "clear" ? lv_color_black() : lv_color_white();
+        ParseCanvasColor(cJSON_GetObjectItem(op, "color"), &color);
+        const int width = std::max(1, std::min(CanvasInt(op, "width", 1), 40));
+
+        if (kind == "line") {
+            lv_draw_line_dsc_t d;
+            lv_draw_line_dsc_init(&d);
+            d.color = color;
+            d.width = width;
+            d.round_start = d.round_end = 1;
+            d.p1.x = CanvasInt(op, "x1", 0);
+            d.p1.y = CanvasInt(op, "y1", 0);
+            d.p2.x = CanvasInt(op, "x2", 0);
+            d.p2.y = CanvasInt(op, "y2", 0);
+            lv_draw_line(layer, &d);
+            return;
+        }
+        if (kind == "text") {
+            lv_draw_label_dsc_t d;
+            lv_draw_label_dsc_init(&d);
+            d.color = color;
+            d.font = font;
+            d.text = cJSON_GetObjectItem(op, "text")->valuestring;
+            d.text_local = 1;
+            const int x = CanvasInt(op, "x", 0);
+            const int y = CanvasInt(op, "y", 0);
+            lv_area_t area = {x, y, kOverlayImageW - 1, kOverlayImageH - 1};
+            lv_draw_label(layer, &d, &area);
+            return;
+        }
+
+        // clear, pixel, rect and circle are all rectangles.
+        lv_area_t area;
+        bool fill = true;
+        int radius = 0;
+        if (kind == "clear") {
+            area = {0, 0, kOverlayImageW - 1, kOverlayImageH - 1};
+        } else if (kind == "pixel") {
+            const int x = CanvasInt(op, "x", 0);
+            const int y = CanvasInt(op, "y", 0);
+            const int size = std::max(1, std::min(CanvasInt(op, "size", 1), 40));
+            area = {x, y, x + size - 1, y + size - 1};
+        } else if (kind == "rect") {
+            const int x = CanvasInt(op, "x", 0);
+            const int y = CanvasInt(op, "y", 0);
+            const int w = std::max(1, CanvasInt(op, "w", 1));
+            const int h = std::max(1, CanvasInt(op, "h", 1));
+            area = {x, y, x + w - 1, y + h - 1};
+            fill = CanvasBool(op, "fill");
+            radius = std::max(0, CanvasInt(op, "radius", 0));
+        } else {  // circle
+            const int x = CanvasInt(op, "x", 0);
+            const int y = CanvasInt(op, "y", 0);
+            const int r = std::max(1, CanvasInt(op, "r", 1));
+            area = {x - r, y - r, x + r, y + r};
+            fill = CanvasBool(op, "fill");
+            radius = LV_RADIUS_CIRCLE;
+        }
+        lv_draw_rect_dsc_t d;
+        lv_draw_rect_dsc_init(&d);
+        d.radius = radius;
+        if (fill) {
+            d.bg_color = color;
+            d.bg_opa = LV_OPA_COVER;
+            d.border_width = 0;
+        } else {
+            d.bg_opa = LV_OPA_TRANSP;
+            d.border_color = color;
+            d.border_opa = LV_OPA_COVER;
+            d.border_width = width;
+        }
+        lv_draw_rect(layer, &d, &area);
+    }
+
+    // Draws a JSON array of shape ops and shows the canvas. Every op is
+    // checked first, so a bad batch draws nothing. Returns "" on success.
+    std::string DrawCanvas(const std::string& json, int* drawn) {
+        *drawn = 0;
+        if (display_ == nullptr) return "no_display";
+        cJSON* ops = cJSON_Parse(json.c_str());
+        if (ops == nullptr || !cJSON_IsArray(ops)) {
+            if (ops != nullptr) cJSON_Delete(ops);
+            return "ops must be a JSON array of shape objects";
+        }
+        const int n = cJSON_GetArraySize(ops);
+        if (n > kCanvasMaxOps) {
+            cJSON_Delete(ops);
+            return "too many ops (max " + std::to_string(kCanvasMaxOps) + ")";
+        }
+        for (int i = 0; i < n; i++) {
+            std::string error = ValidateCanvasOp(cJSON_GetArrayItem(ops, i));
+            if (!error.empty()) {
+                cJSON_Delete(ops);
+                return "op " + std::to_string(i) + ": " + error;
+            }
+        }
+        {
+            DisplayLockGuard lock(display_);
+            if (!EnsureCanvasLocked()) {
+                cJSON_Delete(ops);
+                return "psram_oom";
+            }
+            const lv_font_t* font = LV_FONT_DEFAULT;
+            auto* theme = static_cast<LvglTheme*>(display_->GetTheme());
+            if (theme != nullptr && theme->text_font() != nullptr) font = theme->text_font()->font();
+            lv_layer_t layer;
+            lv_canvas_init_layer(canvas_, &layer);
+            for (int i = 0; i < n; i++) DrawCanvasOp(&layer, cJSON_GetArrayItem(ops, i), font);
+            lv_canvas_finish_layer(canvas_, &layer);
+            lv_obj_clear_flag(canvas_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(canvas_);
+            lv_obj_invalidate(canvas_);
+        }
+        cJSON_Delete(ops);
+        *drawn = n;
+        HandleScreenActivity();
+        return "";
     }
 
     // Queues a GIF; a playing one stops first. Returns false if the player
@@ -7754,7 +7957,33 @@ private:
             [this](const PropertyList&) -> ReturnValue {
                 HideOverlayImage();
                 HideOverlayText();
+                HideCanvas();
                 StopGif();
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", true);
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.display.canvas",
+            "Draw a JSON array of shapes on the canvas above the face.",
+            PropertyList({Property("ops", kPropertyTypeString)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int drawn = 0;
+                std::string error = DrawCanvas(properties["ops"].value<std::string>(), &drawn);
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", error.empty());
+                cJSON_AddNumberToObject(root, "drawn", drawn);
+                if (!error.empty()) cJSON_AddStringToObject(root, "error", error.c_str());
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.display.canvas_hide",
+            "Hide the drawing canvas and show the face again.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                HideCanvas();
                 cJSON* root = cJSON_CreateObject();
                 cJSON_AddBoolToObject(root, "ok", true);
                 return root;
