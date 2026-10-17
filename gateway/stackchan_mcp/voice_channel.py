@@ -42,6 +42,29 @@ VOICE_CHANNEL_ENV_VAR = "STACKCHAN_VOICE_CHANNEL"
 #: Captures shorter than this are almost always a stray button press.
 MIN_FRAMES = 5  # 5 x 60 ms = 300 ms
 
+#: Whisper invents these on silence or room noise (often when nobody
+#: answers a listen_after question). Compared after lowercasing and
+#: dropping punctuation, so only a transcript that is exactly one of
+#: these is ignored.
+FILLER_TRANSCRIPTS = frozenset(
+    {
+        "thanks for watching",
+        "thank you for watching",
+        "thanks for watching see you next time",
+        "thank you for watching see you next time",
+        "please subscribe",
+        "like and subscribe",
+        "subtitles by the amaraorg community",
+        "you",
+    }
+)
+
+
+def is_filler(text: str) -> bool:
+    """True when ``text`` is one of Whisper's known silence fillers."""
+    normalised = "".join(ch for ch in text.lower() if ch.isalnum() or ch.isspace())
+    return " ".join(normalised.split()) in FILLER_TRANSCRIPTS
+
 
 def voice_channel_enabled() -> bool:
     """True when device-driven speech should be transcribed and answered.
@@ -59,7 +82,7 @@ async def transcribe_and_notify(frames: Sequence[bytes], *, session_id: str = ""
     """Transcribe a device-driven capture and push it as a channel message.
 
     Returns the transcript that was sent, or ``None`` when nothing was
-    sent (too short, empty transcript, or an engine error). Errors are
+    sent (too short, empty or filler transcript, or an engine error). Errors are
     logged rather than raised because this runs as a fire-and-forget
     task off the WebSocket read loop.
     """
@@ -100,6 +123,9 @@ async def transcribe_and_notify(frames: Sequence[bytes], *, session_id: str = ""
     elapsed_ms = int((time.monotonic() - started) * 1000)
     if not text:
         logger.info("voice-channel: empty transcript after %d ms, ignoring", elapsed_ms)
+        return None
+    if is_filler(text):
+        logger.info("voice-channel: filler transcript %r, ignoring", text)
         return None
 
     logger.info("voice-channel: heard %r (%d ms STT)", text[:80], elapsed_ms)

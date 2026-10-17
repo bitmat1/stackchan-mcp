@@ -85,3 +85,16 @@ async def test_missing_engine_ignored(sent, monkeypatch):
     monkeypatch.setenv("STACKCHAN_VOICE_STT_ENGINE", "no-such-engine")
     assert await voice_channel.transcribe_and_notify([b"x"] * 10) is None
     assert sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("heard", ["Thanks for watching!", "thank you for watching.", " You. "])
+async def test_filler_transcript_not_sent(sent, heard):
+    _register(heard)
+    assert await voice_channel.transcribe_and_notify([b"x"] * 10) is None
+    assert sent == []
+
+
+@pytest.mark.parametrize("heard", ["Thank you", "Thanks for watching the cat for me", "you there?"])
+def test_real_speech_is_not_filler(heard):
+    assert not voice_channel.is_filler(heard)
