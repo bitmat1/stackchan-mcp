@@ -21,6 +21,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import ImageContent, Notification, TextContent, Tool
 
 from . import __version__, timers
+from .canvas import CANVAS_TOOLS, canvas_ops
 from .gateway import get_gateway
 from .faces import available_faces
 from .gestures import GESTURE_NAMES
@@ -857,6 +858,121 @@ async def _handle_beat_clip_save(arguments: dict[str, Any]) -> list[TextContent]
     return _follow_pose_text({"ok": True, **result})
 
 
+_CANVAS_COLOR = {
+    "description": "Colour name (e.g. 'orange'), '#rrggbb' or [r, g, b]. Default white ('clear': black).",
+}
+_CANVAS_SHAPE_FIELDS: dict[str, Any] = {
+    "x": {"type": "integer", "description": "Left (rect, text, pixel) or centre (circle), 0-319."},
+    "y": {"type": "integer", "description": "Top (rect, text, pixel) or centre (circle), 0-239."},
+    "x1": {"type": "integer"},
+    "y1": {"type": "integer"},
+    "x2": {"type": "integer"},
+    "y2": {"type": "integer"},
+    "w": {"type": "integer", "minimum": 1},
+    "h": {"type": "integer", "minimum": 1},
+    "r": {"type": "integer", "minimum": 1, "description": "Circle radius."},
+    "size": {"type": "integer", "minimum": 1, "maximum": 40, "description": "Pixel size (a size x size square)."},
+    "width": {"type": "integer", "minimum": 1, "maximum": 40, "description": "Line or outline width."},
+    "radius": {"type": "integer", "minimum": 0, "description": "Rectangle corner radius."},
+    "fill": {"type": "boolean", "description": "Fill the rect / circle instead of outlining it."},
+    "text": {"type": "string"},
+    "color": _CANVAS_COLOR,
+}
+
+
+def _canvas_shape_tool(name: str, description: str, fields: list[str], required: list[str]) -> Tool:
+    return Tool(
+        name=name,
+        description=description,
+        inputSchema={
+            "type": "object",
+            "properties": {key: _CANVAS_SHAPE_FIELDS[key] for key in fields},
+            "required": required,
+        },
+    )
+
+
+def _canvas_tools() -> list[Tool]:
+    """Drawing canvas tools: a 320x240 layer above the face (x right, y down)."""
+    return [
+        Tool(
+            name="canvas_draw",
+            description=(
+                "Draw many shapes on the robot's 320x240 canvas above the face "
+                "in one call (x 0-319 left to right, y 0-239 top to bottom). "
+                "Use this for whole drawings: up to 256 shapes, drawn in order "
+                "on top of what is already there. Each shape is an object with "
+                "'shape' = clear | pixel | line | rect | circle | text and the "
+                "same fields as canvas_clear / draw_pixel / draw_line / "
+                "draw_rect / draw_circle / draw_text. The canvas stays until "
+                "canvas_hide, clear_screen_overlay or a tap on the screen."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "shapes": {
+                        "type": "array",
+                        "maxItems": 256,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "shape": {
+                                    "type": "string",
+                                    "enum": ["clear", "pixel", "line", "rect", "circle", "text"],
+                                },
+                                **_CANVAS_SHAPE_FIELDS,
+                            },
+                            "required": ["shape"],
+                        },
+                    },
+                },
+                "required": ["shapes"],
+            },
+        ),
+        _canvas_shape_tool(
+            "canvas_clear",
+            "Fill the whole drawing canvas with one colour (default black) and show it over the face.",
+            ["color"],
+            [],
+        ),
+        _canvas_shape_tool(
+            "draw_pixel",
+            "Set one pixel (or a size x size square) on the drawing canvas.",
+            ["x", "y", "size", "color"],
+            ["x", "y"],
+        ),
+        _canvas_shape_tool(
+            "draw_line",
+            "Draw a line from (x1, y1) to (x2, y2) on the drawing canvas.",
+            ["x1", "y1", "x2", "y2", "width", "color"],
+            ["x1", "y1", "x2", "y2"],
+        ),
+        _canvas_shape_tool(
+            "draw_rect",
+            "Draw a rectangle with its top-left corner at (x, y) on the drawing canvas, outlined or filled.",
+            ["x", "y", "w", "h", "fill", "radius", "width", "color"],
+            ["x", "y", "w", "h"],
+        ),
+        _canvas_shape_tool(
+            "draw_circle",
+            "Draw a circle centred on (x, y) with radius r on the drawing canvas, outlined or filled.",
+            ["x", "y", "r", "fill", "width", "color"],
+            ["x", "y", "r"],
+        ),
+        _canvas_shape_tool(
+            "draw_text",
+            "Write text with its top-left corner at (x, y) on the drawing canvas (one font, about 20 px high).",
+            ["x", "y", "text", "color"],
+            ["x", "y", "text"],
+        ),
+        Tool(
+            name="canvas_hide",
+            description="Hide the drawing canvas and show the face again. The drawing is kept for the next draw call.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+    ]
+
+
 async def _dispatch_mcp_tool(
     name: str,
     arguments: dict[str, Any],
@@ -1115,7 +1231,19 @@ async def _dispatch_mcp_tool_inner(
             ),
         }
 
+    elif name in CANVAS_TOOLS:
+        try:
+            ops = canvas_ops(name, arguments)
+        except ValueError as exc:
+            return [TextContent(type="text", text=json.dumps({"error": str(exc)}))]
+        arguments = {"ops": json.dumps(ops, separators=(",", ":"))}
+
     tool_map: dict[str, tuple[str, dict[str, Any]]] = {
+        **{tool: ("self.display.canvas", arguments) for tool in CANVAS_TOOLS},
+        "canvas_hide": (
+            "self.display.canvas_hide",
+            {},
+        ),
         "get_device_info": (
             "self.get_device_status",
             {},
@@ -2198,9 +2326,10 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
             ),
             Tool(
                 name="clear_screen_overlay",
-                description="Hide any picture, caption or GIF shown with show_image / show_text / show_gif.",
+                description="Hide any picture, caption, GIF or drawing shown with show_image / show_text / show_gif / the canvas tools.",
                 inputSchema={"type": "object", "properties": {}},
             ),
+            *_canvas_tools(),
             Tool(
                 name="set_gaze",
                 description=(
