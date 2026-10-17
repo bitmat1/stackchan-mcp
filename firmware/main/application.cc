@@ -655,11 +655,22 @@ void Application::InitializeProtocol() {
                 ESP_LOGW(TAG, "listen message missing state");
             } else if (strcmp(state->valuestring, "start") == 0) {
                 auto profile = ParseListenProfile(root);
-                Schedule([this, profile]() {
-                    // The gateway owns this capture window; no auto-stop.
-                    server_driven_listen_ = true;
-                    StartListening(profile);
-                });
+                if (cJSON_IsTrue(cJSON_GetObjectItem(root, "auto_stop"))) {
+                    // Listen for the answer to a question: wait for the
+                    // speech to play out (there is no echo cancellation),
+                    // then listen like a tap, ending on silence.
+                    Schedule([this, profile]() {
+                        audio_service_.WaitForPlaybackQueueEmpty();
+                        vTaskDelay(pdMS_TO_TICKS(150));
+                        StartListening(profile);
+                    });
+                } else {
+                    Schedule([this, profile]() {
+                        // The gateway owns this capture window; no auto-stop.
+                        server_driven_listen_ = true;
+                        StartListening(profile);
+                    });
+                }
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 StopListening();
             } else {
