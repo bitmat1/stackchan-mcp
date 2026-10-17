@@ -451,6 +451,16 @@ async def synthesize_and_send(
     }
     if text_stripped:
         response["tts_text"] = tts_text
+    if arguments.get("listen_after"):
+        # Open the mic for the reply. The device waits for playback to
+        # drain first and ends the turn on silence, so the answer arrives
+        # through the voice channel like a tapped utterance.
+        try:
+            await gateway.esp32.send_listen_state("start", auto_stop=True)
+            response["listening"] = True
+        except ConnectionError as exc:
+            response["listening"] = False
+            response["listen_error"] = str(exc)
     return response
 
 

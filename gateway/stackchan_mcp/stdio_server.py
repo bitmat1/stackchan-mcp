@@ -2805,6 +2805,17 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                                 "Ignored by engines that do not support it."
                             ),
                         },
+                        "listen_after": {
+                            "type": "boolean",
+                            "description": (
+                                "Start listening as soon as the speech has "
+                                "played, so the person can answer without "
+                                "tapping. Set it when the text ends with a "
+                                "question. The reply arrives as a voice "
+                                "channel message."
+                            ),
+                            "default": False,
+                        },
                     },
                     "required": ["text"],
                 },

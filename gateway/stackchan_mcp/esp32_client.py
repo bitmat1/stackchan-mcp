@@ -421,6 +421,7 @@ class ESP32Connection:
         state: str,
         mode: str = "manual",
         profile: str = "voice",
+        auto_stop: bool = False,
     ) -> None:
         """Send a listen state notification (``start`` / ``stop``).
 
@@ -442,6 +443,10 @@ class ESP32Connection:
         from the JSON to keep the wire shape compatible with older logs
         and firmware. Beat mode uses ``"raw"`` to bypass the device-side
         speech AFE path.
+
+        ``auto_stop`` asks the device to wait for playback to drain, then
+        listen like a tap: it ends the turn on silence and the capture
+        goes to the voice channel instead of an MCP ``listen()`` call.
         """
         if not self._connected:
             raise ConnectionError("ESP32 not connected")
@@ -454,6 +459,8 @@ class ESP32Connection:
             message["mode"] = mode
             if profile != "voice":
                 message["profile"] = profile
+            if auto_stop:
+                message["auto_stop"] = True
         await self._ws_send(json.dumps(message))
 
     def disconnect(self) -> None:
@@ -1185,6 +1192,7 @@ class ESP32Manager:
         state: str,
         mode: str = "manual",
         profile: str = "voice",
+        auto_stop: bool = False,
     ) -> None:
         """Send a listen state notification to put the device into /
         out of listening mode (Issue #91).
@@ -1194,7 +1202,9 @@ class ESP32Manager:
         """
         if not self._connection or not self._connection.connected:
             raise ConnectionError("No ESP32 device connected")
-        await self._connection.send_listen_state(state, mode=mode, profile=profile)
+        await self._connection.send_listen_state(
+            state, mode=mode, profile=profile, auto_stop=auto_stop
+        )
 
     def get_status(self) -> dict[str, Any]:
         """Get current connection status."""

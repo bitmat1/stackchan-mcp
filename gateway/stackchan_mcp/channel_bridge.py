@@ -90,6 +90,7 @@ class ChannelBridge:
         self.headers = {"Authorization": f"Bearer {token}"} if token else None
         self.daemon: ClientSession | None = None
         self.daemon_ready = asyncio.Event()
+        self.daemon_lost = asyncio.Event()
         self.claude_session: Any | None = None
         self.pending: list[dict[str, Any]] = []
         self.server = self._build_server()
@@ -126,7 +127,17 @@ class ChannelBridge:
                     ],
                     isError=True,
                 )
-            return await daemon.call_tool(name, arguments)
+            try:
+                return await daemon.call_tool(name, arguments)
+            except Exception as exc:
+                # A restarted daemon forgets our MCP session ("Session
+                # terminated"); reconnect and retry once.
+                logger.warning("daemon call %s failed (%s); reconnecting", name, exc)
+                self._drop_daemon(daemon)
+                daemon = await self._wait_for_daemon()
+                if daemon is None:
+                    raise
+                return await daemon.call_tool(name, arguments)
 
         return server
 
@@ -134,6 +145,12 @@ class ChannelBridge:
         if self.claude_session is None:
             self.claude_session = server.request_context.session
             asyncio.get_running_loop().create_task(self._flush_pending())
+
+    def _drop_daemon(self, daemon: ClientSession) -> None:
+        if self.daemon is daemon:
+            self.daemon = None
+            self.daemon_ready.clear()
+            self.daemon_lost.set()
 
     async def _wait_for_daemon(self, timeout: float = 10.0) -> ClientSession | None:
         try:
@@ -177,9 +194,11 @@ class ChannelBridge:
                     ) as session:
                         await session.initialize()
                         self.daemon = session
+                        self.daemon_lost.clear()
                         self.daemon_ready.set()
                         logger.info("connected to stackchan daemon at %s", self.url)
-                        await asyncio.Event().wait()
+                        await self.daemon_lost.wait()
+                        continue
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

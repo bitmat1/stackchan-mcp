@@ -1050,6 +1050,23 @@ async def test_connection_send_listen_state_raw_profile_includes_profile():
 
 
 @pytest.mark.asyncio
+async def test_connection_send_listen_state_auto_stop_flag():
+    """listen.start carries auto_stop only when the device should end on silence."""
+    ws = _FakeWebSocket()
+    conn = ESP32Connection(ws, session_id="session-listen")  # type: ignore[arg-type]
+
+    await conn.send_listen_state("start", auto_stop=True)
+
+    assert json.loads(ws.sent[0]) == {
+        "session_id": "session-listen",
+        "type": "listen",
+        "state": "start",
+        "mode": "manual",
+        "auto_stop": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_connection_send_listen_state_stop_omits_mode():
     """listen.stop has no mode field — the wire shape mirrors the firmware.
 
