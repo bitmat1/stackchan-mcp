@@ -32,6 +32,7 @@ This is a fork of [kisaragi-mochi/stackchan-mcp](https://github.com/kisaragi-moc
 - **Wake word:** custom wake word ("hey robot") from precomputed phonemes, without the ~600 KB Flite lexicon; repeat-wake fix.
 - **Listening:** a tapped listening turn ends by itself after a stretch of silence. A double knock felt by the IMU also starts listening, as the RT ver. has no head-touch sensor (`set_knock_threshold`, and `peak_jolt_g` in `get_motion` for tuning). Optionally a spoken cue ("What do you want?") replaces the beep, and the mic opens only after it has played (there is no echo cancellation).
 - **Listen after a question:** a gateway `listen` start with `"auto_stop": true` waits for the speech to finish, then listens like a tap and ends on silence.
+- **Drawing canvas:** a 320x240 canvas above the face (`self.display.canvas` / `canvas_hide`) that draws a batch of up to 256 pixels, lines, rectangles, circles and text in one call.
 - **Status and fixes:** device status reports Wi-Fi signal, free RAM and PSRAM and uptime; the BMI270 is soft-reset and retried after an ESP32-only reset; diagnostic tools moved behind `CONFIG_STACKCHAN_DIAGNOSTIC_TOOLS`; one-line tool descriptions.
 
 **Gateway (`gateway/`)**
@@ -39,6 +40,8 @@ This is a fork of [kisaragi-mochi/stackchan-mcp](https://github.com/kisaragi-moc
 - **Local voice:** macOS `say` and Kokoro text-to-speech engines, speech pacing and prebuffering, and subtitles while speaking.
 - **Voice channel:** speech the robot hears (tap, knock or wake word) is transcribed by local Whisper and sent to a Claude Code session as a channel message, through a stdio channel bridge to the running HTTP gateway (see `voice-session/`). The bridge reconnects if the gateway restarts.
 - **`say` with `listen_after`:** after asking a question the robot listens straight away, so the person can answer without tapping.
+- **Filler filter:** transcripts that Whisper invents on silence, such as "Thanks for watching!", are dropped instead of being sent to the session.
+- **Drawing tools:** `canvas_draw` (many shapes in one call), `canvas_clear`, `draw_pixel`, `draw_line`, `draw_rect`, `draw_circle`, `draw_text` and `canvas_hide`, with colour names, `#rrggbb` or `[r, g, b]`.
 - **Robot tools:** procedural face names and styles, named head gestures, configurable pitch limits, `show_image` / `show_gif` / `show_text` and screen tools (GIFs are re-encoded to fit 320x240), body events forwarded like head touches, and a camera capture URL that follows the address the robot connected on.
 - **Timers:** `set_timer`, `set_reminder`, `set_alarm`, `list_timers` and `cancel_timer`, spoken by the gateway at the right time even with no Claude session open, and saved to `timers.json`.
 - **Control panel (`/ui`):** expressions, head, speech, screen, settings, every tool, a brain switch, robot health, timers with a live countdown, and an activity feed of speech, tool calls and robot events.
