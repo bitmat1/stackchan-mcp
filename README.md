@@ -17,6 +17,36 @@ An MCP (Model Context Protocol) bridge for the **M5Stack official [StackChan](ht
 
 From any MCP client (Claude Code / Claude Desktop / others) you can call StackChan operations such as head movement, camera capture, touch sensor reads, and avatar expression switches.
 
+## About this fork
+
+This is a fork of [kisaragi-mochi/stackchan-mcp](https://github.com/kisaragi-mochi/stackchan-mcp). Its `rt-dynamixel` branch adapts it to the **Stack-chan RT ver.** (DYNAMIXEL XL330 servos, no head-touch sensor) and makes the robot a hands-free, local voice assistant for Claude Code. Setup is in [`docs/rt-claude-setup.md`](docs/rt-claude-setup.md). Changes from the original:
+
+**Firmware (`firmware/`)**
+
+- **DYNAMIXEL servos:** a Protocol 2.0 half-duplex driver for the XL330 servos used by the RT board instead of the SCS0009 servos, with pitch limits, a rest pose and no torque release.
+- **RT ver. board support:** board file, Kconfig options and build config (TX7/RX6 servo bus); skips the xiaozhi cloud check; English UI; finds the gateway by mDNS.
+- **Procedural faces:** about 27 expressions in Stack-chan and Bender styles, drawn from signed distance fields instead of bitmaps, on a dedicated face task with double-buffered frames, plus a host-side preview tool.
+- **Display fix:** holds the microSD chip select (GPIO4) high, because a card answering on the shared D/C line corrupted the panel.
+- **Screen extras:** clock screensaver, Wi-Fi and battery icons, scrolling subtitles, a ticker, `show_image` / `show_text` overlays and `show_gif` (plays a GIF from PSRAM at about 14 fps).
+- **Body sensors:** BMI270 IMU and LTR-553 proximity drivers that raise picked up / put down / tipped over / shaken and near / far events (ignoring the robot's own head motion), with `get_motion` and `get_proximity` tools. A body event wakes the robot from the screensaver; it powers off after 10 minutes idle.
+- **Wake word:** custom wake word ("hey robot") from precomputed phonemes, without the ~600 KB Flite lexicon; repeat-wake fix.
+- **Listening:** a tapped listening turn ends by itself after a stretch of silence. A double knock felt by the IMU also starts listening, as the RT ver. has no head-touch sensor (`set_knock_threshold`, and `peak_jolt_g` in `get_motion` for tuning). Optionally a spoken cue ("What do you want?") replaces the beep, and the mic opens only after it has played (there is no echo cancellation).
+- **Listen after a question:** a gateway `listen` start with `"auto_stop": true` waits for the speech to finish, then listens like a tap and ends on silence.
+- **Status and fixes:** device status reports Wi-Fi signal, free RAM and PSRAM and uptime; the BMI270 is soft-reset and retried after an ESP32-only reset; diagnostic tools moved behind `CONFIG_STACKCHAN_DIAGNOSTIC_TOOLS`; one-line tool descriptions.
+
+**Gateway (`gateway/`)**
+
+- **Local voice:** macOS `say` and Kokoro text-to-speech engines, speech pacing and prebuffering, and subtitles while speaking.
+- **Voice channel:** speech the robot hears (tap, knock or wake word) is transcribed by local Whisper and sent to a Claude Code session as a channel message, through a stdio channel bridge to the running HTTP gateway (see `voice-session/`). The bridge reconnects if the gateway restarts.
+- **`say` with `listen_after`:** after asking a question the robot listens straight away, so the person can answer without tapping.
+- **Robot tools:** procedural face names and styles, named head gestures, configurable pitch limits, `show_image` / `show_gif` / `show_text` and screen tools (GIFs are re-encoded to fit 320x240), body events forwarded like head touches, and a camera capture URL that follows the address the robot connected on.
+- **Timers:** `set_timer`, `set_reminder`, `set_alarm`, `list_timers` and `cancel_timer`, spoken by the gateway at the right time even with no Claude session open, and saved to `timers.json`.
+- **Control panel (`/ui`):** expressions, head, speech, screen, settings, every tool, a brain switch, robot health, timers with a live countdown, and an activity feed of speech, tool calls and robot events.
+- **Stack-chan.app:** `stackchan-mcp app` and `scripts/make-app.sh` build a double-click app that starts the gateway and opens the panel and the Claude voice session.
+- **Local brain:** optionally answers speech with a local Ollama model instead of Claude, switchable from the panel, sharing a robot memory file with the Claude session.
+
+**Docs:** the RT ver. setup guide, tool table entries for the new sensors, and face preview images in `docs/images/`.
+
 ## Repository layout
 
 This repository is a monorepo.
