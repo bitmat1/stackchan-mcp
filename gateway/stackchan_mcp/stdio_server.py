@@ -2315,12 +2315,13 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                 name="set_face_style",
                 description=(
                     "Switch the robot's face look: 'stackchan' (classic white "
-                    "dot eyes) or 'bender' (visor, round eyes, grille mouth). "
-                    "All expressions work in both. Saved on the robot."
+                    "dot eyes), 'bender' (visor, round eyes, grille mouth) or "
+                    "'hal' (HAL 9000 red lens that glows brighter as it speaks). "
+                    "All expressions work in every style. Saved on the robot."
                 ),
                 inputSchema={
                     "type": "object",
-                    "properties": {"style": {"type": "string", "enum": ["stackchan", "bender"]}},
+                    "properties": {"style": {"type": "string", "enum": ["stackchan", "bender", "hal"]}},
                     "required": ["style"],
                 },
             ),

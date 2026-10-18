@@ -71,6 +71,7 @@ bool IsAnimated(Expression e);
 enum class Style : uint8_t {
     kStackchan = 0,  // white dot eyes and line mouth on black
     kBender,         // visor, round eyes with square pupils, grille mouth
+    kHal,            // HAL 9000 lens: a red glow that swells with speech
     kCount,
 };
 
@@ -90,6 +91,10 @@ struct State {
     float gaze_y = 0.0f;
     // Milliseconds since start, drives animated overlays.
     uint32_t tick_ms = 0;
+    // True while speech is playing. Styles without a mouth (HAL) animate
+    // from tick_ms instead of the coarse lip-sync steps, so every frame
+    // drawn shows a fresh level however slowly frames arrive.
+    bool speaking = false;
 };
 
 struct Theme {

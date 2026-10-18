@@ -5428,6 +5428,7 @@ private:
         state.eyes = active_layer_ == ActiveLayer::EYES ? current_eyes_index_ : 0;
         state.mouth = active_layer_ == ActiveLayer::MOUTH ? current_mouth_index_ : -1;
         state.tick_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
+        state.speaking = tts_lipsync_active_.load(std::memory_order_acquire);
         state.style = face_style_;
         state.gaze_x = gaze_x_;
         state.gaze_y = gaze_y_;
@@ -7933,7 +7934,7 @@ private:
                 bool ok = SetFaceStyle(properties["style"].value<std::string>());
                 cJSON* root = cJSON_CreateObject();
                 cJSON_AddBoolToObject(root, "ok", ok);
-                if (!ok) cJSON_AddStringToObject(root, "error", "unknown style; use stackchan or bender");
+                if (!ok) cJSON_AddStringToObject(root, "error", "unknown style; use stackchan, bender or hal");
                 return root;
             });
 #endif

@@ -137,6 +137,34 @@ public:
         }
     }
 
+    // Like Fill, but `f(p, out)` sets a per-pixel colour in `out` and
+    // returns the signed distance, for shaded shapes such as a glow.
+    template <typename F>
+    void Paint(V2 lo, V2 hi, F f) {
+        int x0 = std::max(0, static_cast<int>(std::floor(lo.x * scale_ + ox_)) - 1);
+        int y0 = std::max(0, static_cast<int>(std::floor(lo.y * scale_ + oy_)) - 1);
+        int x1 = std::min(w_ - 1, static_cast<int>(std::ceil(hi.x * scale_ + ox_)) + 1);
+        int y1 = std::min(h_ - 1, static_cast<int>(std::ceil(hi.y * scale_ + oy_)) + 1);
+        const float inv = 1.0f / scale_;
+        for (int y = y0; y <= y1; y++) {
+            for (int x = x0; x <= x1; x++) {
+                V2 p = {(x + 0.5f - ox_) * inv, (y + 0.5f - oy_) * inv};
+                Rgb color{};
+                float a = Clamp01(0.5f - f(p, color) * scale_);
+                if (a <= 0.0f) continue;
+                uint16_t& dst = px_[y * w_ + x];
+                if (a >= 1.0f) {
+                    dst = ToRgb565(color);
+                } else {
+                    Rgb under = FromRgb565(dst);
+                    dst = ToRgb565({static_cast<uint8_t>(under.r + (color.r - under.r) * a),
+                                    static_cast<uint8_t>(under.g + (color.g - under.g) * a),
+                                    static_cast<uint8_t>(under.b + (color.b - under.b) * a)});
+                }
+            }
+        }
+    }
+
     void Circle(V2 c, float r, Rgb color, float alpha = 1) {
         Fill(c - V2{r, r}, c + V2{r, r}, color, alpha, [&](V2 p) { return Len(p - c) - r; });
     }
@@ -926,11 +954,170 @@ void RenderBender(const State& s, const Theme& theme, Canvas& c) {
     DrawOverlays(c, overlays & ~(kGloom), s);
 }
 
+// ---- HAL 9000 style --------------------------------------------------------
+//
+// A chrome bezel around a black lens with a red glow at its centre. There
+// are no eyes or mouth: lip-sync levels swell and brighten the glow, blinks
+// dim it, and expressions change its brightness, size and pulse.
+
+struct HalSpec {
+    float bright;        // glow intensity, 1 = normal
+    float size;          // glow radius scale, 1 = normal
+    uint16_t pulse_ms;   // pulse period, 0 = steady
+    float pulse_amp;     // pulse depth as a fraction of brightness
+    bool pink;           // warmer pink-red glow (love, embarrassed)
+};
+
+const HalSpec kHalSpecs[kNumExpressions] = {
+    // bright size  pulse  amp    pink
+    {1.00f, 1.00f,    0, 0.00f, false},  // idle
+    {1.10f, 1.05f,    0, 0.00f, false},  // happy
+    {0.85f, 0.95f, 1600, 0.25f, false},  // thinking
+    {0.60f, 0.90f,    0, 0.00f, false},  // sad
+    {1.30f, 1.25f,    0, 0.00f, false},  // surprised
+    {0.90f, 1.00f,    0, 0.00f, true},   // embarrassed
+    {1.20f, 1.10f,  400, 0.12f, false},  // laughing
+    {1.25f, 1.15f,  300, 0.15f, false},  // excited
+    {1.10f, 1.05f,  900, 0.15f, true},   // love
+    {1.00f, 1.00f,    0, 0.00f, false},  // wink
+    {1.05f, 0.90f,    0, 0.00f, false},  // smug
+    {0.90f, 0.95f,    0, 0.00f, false},  // cool
+    {0.55f, 0.90f, 1800, 0.10f, false},  // crying
+    {1.35f, 0.85f,  120, 0.10f, false},  // angry
+    {1.15f, 0.90f,    0, 0.00f, false},  // annoyed
+    {1.30f, 1.25f,  150, 0.08f, false},  // shocked
+    {0.90f, 1.00f, 1400, 0.10f, false},  // confused
+    {0.85f, 0.95f,    0, 0.00f, false},  // doubtful
+    {0.35f, 0.80f, 3000, 0.20f, false},  // sleepy
+    {0.55f, 0.90f,    0, 0.00f, false},  // bored
+    {0.95f, 0.95f,   90, 0.06f, false},  // nervous
+    {1.25f, 1.20f,  110, 0.10f, false},  // scared
+    {1.05f, 1.10f,    0, 0.00f, false},  // curious
+    {1.00f, 1.00f,    0, 0.00f, false},  // dizzy (centre wobbles)
+    {0.80f, 1.00f,    0, 0.00f, false},  // relieved
+    {1.00f, 1.00f, 1200, 0.10f, false},  // listening
+    {0.80f, 0.95f,    0, 0.00f, true},   // kiss
+};
+
+static_assert(sizeof(kHalSpecs) / sizeof(kHalSpecs[0]) == kNumExpressions,
+              "hal spec per expression");
+
+// Overlays that float clear of the lens; tears, blush and sweat belong to
+// a face this style does not have.
+constexpr uint16_t kHalOverlays = kQuestion | kExclaim | kZzz | kHearts | kDots | kAnger;
+
+constexpr V2 kHalCentre = {160, 120};
+constexpr float kHalBezelR = 112;
+constexpr float kHalLensR = 94;
+constexpr float kHalGlowR = 60;
+
+// Glow level for a lip-sync mouth shape: closed / half / open / e / u.
+float HalSpeechLevel(int lip) {
+    switch (lip) {
+        case 1: return 0.55f;
+        case 2: return 1.0f;
+        case 3: return 0.75f;
+        case 4: return 0.65f;
+        default: return 0.0f;
+    }
+}
+
+uint8_t ToByte(float v) { return static_cast<uint8_t>(Clamp01(v) * 255.0f + 0.5f); }
+
+void RenderHal(const State& s, Canvas& c) {
+    int idx = static_cast<int>(s.expression);
+    if (idx < 0 || idx >= kNumExpressions) idx = 0;
+    const HalSpec& h = kHalSpecs[idx];
+    const uint16_t overlays = kSpecs[idx].overlays & kHalOverlays;
+
+    // Glow centre: follows gaze a little; dizzy makes it wander.
+    V2 g = V2{s.gaze_x, s.gaze_y} * 0.4f + kSpecs[idx].gaze * 0.4f;
+    if (s.expression == Expression::kDizzy) {
+        const float a = Ramp(s.tick_ms, 1400) * 2 * kPi;
+        g = g + V2{10 * std::cos(a), 10 * std::sin(a)};
+    }
+    const float gl = Len(g);
+    if (gl > 20) g = g * (20 / gl);
+    const V2 gc = kHalCentre + g;
+
+    // Speech swells and brightens the glow; blinks dim it; pulses throb.
+    // While speaking, a flicker of two incommensurate waves reads as a
+    // voice; otherwise follow any manual mouth shape.
+    const float speech = s.speaking
+        ? Clamp01(0.55f + 0.3f * Wave(s.tick_ms, 430) + 0.25f * Wave(s.tick_ms, 170, 0.3f))
+        : HalSpeechLevel(s.mouth);
+    float bright = h.bright * (1.0f + 0.35f * speech);
+    if (h.pulse_ms > 0) bright *= 1.0f + h.pulse_amp * Wave(s.tick_ms, h.pulse_ms);
+    if (s.eyes == 1) bright *= 0.5f;
+    else if (s.eyes >= 2) bright *= 0.12f;
+    const float glow_r = kHalGlowR * h.size * (1.0f + 0.45f * speech);
+    const float core_r = (7 + 6 * speech) * h.size;
+    const float green = h.pink ? 0.25f : 0.08f, blue = h.pink ? 0.35f : 0.05f;
+
+    // Bezel, gap, lens and glow in one pass, so each pixel is written once:
+    // drawing them as separate layers made this face too slow to follow
+    // speech. The chrome ring darkens toward the bottom (lit from above).
+    const float glow_r2 = glow_r * glow_r;
+    const float inv_core_r = 1.0f / core_r, core_r2 = core_r * core_r;
+    // Glow falloff (1 - d/r)^2 tabulated by (d/r)^2, so most lens pixels
+    // need no square root.
+    constexpr int kLut = 256;
+    float falloff[kLut + 1];
+    for (int i = 0; i <= kLut; i++) {
+        const float u = 1 - std::sqrt(static_cast<float>(i) / kLut);
+        falloff[i] = u * u * bright;
+    }
+    const float lut_scale = kLut / glow_r2;
+    const float core_bright = Clamp01(bright);
+    const Rgb lens_dark = {ToByte(0.05f), 0, 0};
+    // Square roots only where an edge needs anti-aliasing or the glow is.
+    constexpr float kOuterIn2 = (kHalBezelR - 1) * (kHalBezelR - 1);
+    constexpr float kOuterOut2 = (kHalBezelR + 1) * (kHalBezelR + 1);
+    constexpr float kGap2 = (kHalLensR + 6) * (kHalLensR + 6);
+    constexpr float kLensOut2 = (kHalLensR + 1) * (kHalLensR + 1);
+    constexpr float kLensIn2 = (kHalLensR - 1) * (kHalLensR - 1);
+    c.Paint(kHalCentre - V2{kHalBezelR, kHalBezelR}, kHalCentre + V2{kHalBezelR, kHalBezelR},
+            [&](V2 p, Rgb& out) {
+                const V2 o = p - kHalCentre;
+                const float r2 = Dot(o, o);
+                if (r2 >= kOuterOut2) return 1.0f;
+                if (r2 > kGap2) {
+                    const float v = 0.85f - 0.55f * Clamp01((o.y + kHalBezelR) / (2 * kHalBezelR));
+                    out = {ToByte(v * 0.86f), ToByte(v * 0.88f), ToByte(v * 0.92f)};
+                    return r2 > kOuterIn2 ? std::sqrt(r2) - kHalBezelR : -1.0f;
+                }
+                if (r2 >= kLensOut2) {
+                    out = {14, 14, 16};
+                    return -1.0f;
+                }
+                const float edge = r2 > kLensIn2 ? std::sqrt(r2) - kHalLensR : -1.0f;
+                const V2 q = p - gc;
+                const float d2 = Dot(q, q);
+                if (d2 >= glow_r2) {
+                    out = lens_dark;
+                    return edge;
+                }
+                const float k = falloff[static_cast<int>(d2 * lut_scale)];
+                float cc = 0;
+                if (d2 < core_r2) {
+                    const float core = (1 - std::sqrt(d2) * inv_core_r) * core_bright;
+                    cc = core * core;
+                }
+                const float hot = Clamp01(k - 0.9f);
+                out = {ToByte(0.05f + 1.25f * k + cc), ToByte(green * k + hot * 0.6f + cc * 0.92f),
+                       ToByte(blue * k + hot * 0.3f + cc * 0.78f)};
+                return edge;
+            });
+
+    DrawOverlays(c, overlays, s);
+}
+
 }  // namespace
 
 const char* StyleName(Style s) {
     switch (s) {
         case Style::kBender: return "bender";
+        case Style::kHal: return "hal";
         case Style::kStackchan:
         default: return "stackchan";
     }
@@ -942,6 +1129,9 @@ int StyleFromName(const char* name) {
         return static_cast<int>(Style::kStackchan);
     }
     if (std::strcmp(name, "bender") == 0) return static_cast<int>(Style::kBender);
+    if (std::strcmp(name, "hal") == 0 || std::strcmp(name, "hal9000") == 0) {
+        return static_cast<int>(Style::kHal);
+    }
     return -1;
 }
 
@@ -1031,6 +1221,10 @@ void Render(const State& state, const Theme& theme, uint16_t* pixels, int width,
     Canvas c(pixels, width, height, FromRgb565(theme.foreground));
     if (state.style == Style::kBender) {
         RenderBender(state, theme, c);
+        return;
+    }
+    if (state.style == Style::kHal) {
+        RenderHal(state, c);
         return;
     }
 
