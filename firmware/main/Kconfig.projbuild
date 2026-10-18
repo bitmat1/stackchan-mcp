@@ -1283,14 +1283,6 @@ config STACKCHAN_KNOCK_TO_LISTEN
         robots without the Si12T head-touch sensor. The sensitivity can be
         changed at run time with self.sensors.set_knock_threshold.
 
-config STACKCHAN_LISTEN_VOICE_CUE
-    bool "Say assets/common/listen_cue.ogg instead of the beep for touch listening"
-    default n
-    help
-        A screen tap or knock that starts listening from idle plays
-        listen_cue.ogg (e.g. "Yes?") first and opens the microphone once
-        it has finished, so the robot does not hear itself.
-
 config STACKCHAN_CLOCK_SCREENSAVER_SECONDS
     int "Show a clock after this many idle seconds (0 = off)"
     default 0

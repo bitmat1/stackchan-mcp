@@ -998,13 +998,6 @@ private:
     bool si12t_ok_ = false;
     esp_timer_handle_t touch_poll_timer_ = nullptr;
     esp_timer_handle_t touch_revert_timer_ = nullptr;
-    // Spoken listen cue (CONFIG_STACKCHAN_LISTEN_VOICE_CUE): the mic opens
-    // once the cue has finished playing.
-    static constexpr int LISTEN_CUE_MAX_MS = 2500;
-    esp_timer_handle_t listen_cue_timer_ = nullptr;
-    std::atomic<bool> listen_cue_pending_{false};
-    bool listen_cue_drained_ = false;
-    uint64_t listen_cue_started_us_ = 0;
 
 #if CONFIG_STACKCHAN_BODY_SENSORS
     // On-board IMU and proximity sensor (body_sensors.h). Polled from the
@@ -3305,9 +3298,6 @@ private:
     void ToggleTouchListening() {
         auto& app = Application::GetInstance();
         const auto state = app.GetDeviceState();
-        if (listen_cue_pending_.load()) {
-            return;  // already on the way to listening
-        }
         if (state == kDeviceStateListening) {
             // 録音終了のフィードバック (= 全 LED 消灯)。 デバッグ目的、
             // MCP self.led.set_* 経由で上書き可能。
@@ -3331,64 +3321,10 @@ private:
             // な輝度)。 実際の listen 起動は StartListening 経由で
             // 非同期処理。 タッチが取れたかどうかの体感を優先。
             SetAllRgbLeds(0, 32, 0);
-#if CONFIG_STACKCHAN_LISTEN_VOICE_CUE
-            if (state == kDeviceStateIdle) {
-                StartListeningAfterCue();
-                return;
-            }
-#endif
             app.StartListening();
         }
     }
 
-#if CONFIG_STACKCHAN_LISTEN_VOICE_CUE
-    // Say listen_cue.ogg ("What do you want?"), then start listening without the
-    // popup beep. The mic opens only after the cue has played out, as
-    // there is no echo cancellation and it would otherwise be transcribed.
-    void StartListeningAfterCue() {
-        if (listen_cue_pending_.exchange(true)) return;
-        if (listen_cue_timer_ == nullptr) {
-            esp_timer_create_args_t args = {
-                .callback = [](void* arg) { static_cast<StackChanBoard*>(arg)->ListenCueTick(); },
-                .arg = this,
-                .dispatch_method = ESP_TIMER_TASK,
-                .name = "listen_cue",
-                .skip_unhandled_events = true,
-            };
-            if (esp_timer_create(&args, &listen_cue_timer_) != ESP_OK) {
-                listen_cue_pending_.store(false);
-                Application::GetInstance().StartListening();
-                return;
-            }
-        }
-        listen_cue_drained_ = false;
-        listen_cue_started_us_ = esp_timer_get_time();
-        Application::GetInstance().PlaySound(Lang::Sounds::OGG_LISTEN_CUE);
-        esp_timer_start_once(listen_cue_timer_, 300 * 1000);
-    }
-
-    void ListenCueTick() {
-        auto& app = Application::GetInstance();
-        const uint64_t elapsed_ms = (esp_timer_get_time() - listen_cue_started_us_) / 1000;
-        if (!listen_cue_drained_ && elapsed_ms < LISTEN_CUE_MAX_MS) {
-            if (!app.GetAudioService().IsPlaybackIdle()) {
-                esp_timer_start_once(listen_cue_timer_, 50 * 1000);
-                return;
-            }
-            // Queues are empty; let the last frame leave the speaker.
-            listen_cue_drained_ = true;
-            esp_timer_start_once(listen_cue_timer_, 150 * 1000);
-            return;
-        }
-        listen_cue_pending_.store(false);
-        if (app.GetDeviceState() == kDeviceStateIdle) {
-            app.SkipNextListeningCue();
-            app.StartListening();
-        } else {
-            SetAllRgbLeds(0, 0, 0);
-        }
-    }
-#endif
 
     void InitializeFt6336TouchPad() {
         ESP_LOGI(TAG, "Init FT6336");
