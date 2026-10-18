@@ -1064,6 +1064,30 @@ async def _dispatch_mcp_tool_inner(
         )
         return [TextContent(type="text", text=json.dumps(result, default=str))]
 
+    if name == "play_midi":
+        source = arguments.get("midi", "")
+        notes = arguments.get("notes", "")
+        if not isinstance(source, str) or not isinstance(notes, str) or not (source or notes):
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": "midi or notes is required"}))]
+        result = await gateway.play_midi(
+            source=source,
+            notes=notes,
+            tempo=int(arguments.get("tempo", 120)),
+            program=int(arguments.get("program", 0)),
+            loops=int(arguments.get("loops", 0)),
+            volume=int(arguments.get("volume", 80)),
+        )
+        return [TextContent(type="text", text=json.dumps(result, default=str))]
+
+    if name == "midi_send":
+        from .midi import parse_send_bytes
+
+        try:
+            data = parse_send_bytes(str(arguments.get("hex", "")))
+        except ValueError as exc:
+            return [TextContent(type="text", text=json.dumps({"ok": False, "error": str(exc)}))]
+        arguments = {"hex": data.hex(" "), "volume": int(arguments.get("volume", 80))}
+
     if name == "set_subtitles":
         from .subtitles import set_subtitles_enabled, subtitles_enabled
 
@@ -1357,6 +1381,18 @@ async def _dispatch_mcp_tool_inner(
         ),
         "clear_screen_overlay": (
             "self.display.clear_overlay",
+            {},
+        ),
+        "midi_send": (
+            "self.audio.midi_send",
+            arguments,
+        ),
+        "midi_stop": (
+            "self.audio.midi_stop",
+            {},
+        ),
+        "midi_status": (
+            "self.audio.midi_status",
             {},
         ),
         "set_gaze": (
@@ -2234,6 +2270,67 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                     },
                     "required": ["image"],
                 },
+            ),
+            Tool(
+                name="play_midi",
+                description=(
+                    "Play music on the robot's built-in General MIDI synth "
+                    "(all 128 GM instruments plus drum kits on channel 10). "
+                    "Give either `midi`, a .mid file path on this computer, an "
+                    "http(s) URL or base64, or `notes`, a melody such as "
+                    "'C4 D4 E4:2 R:0.5 G#4:0.5 C4+E4+G4:2' (note + octave, "
+                    "C4 = middle C, ':beats' length, default 1, R = rest, "
+                    "+ joins a chord) played at `tempo` on GM instrument "
+                    "`program` (0 piano, 11 vibraphone, 24 guitar, 40 violin, "
+                    "56 trumpet, 73 flute, 80 square lead). Music pauses "
+                    "while the robot speaks and stops when it listens; "
+                    "midi_stop ends it."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "midi": {"type": "string", "description": "MIDI file path, http(s) URL or base64 data."},
+                        "notes": {"type": "string", "description": "Melody text (used instead of midi)."},
+                        "tempo": {"type": "integer", "minimum": 20, "maximum": 400, "default": 120},
+                        "program": {"type": "integer", "minimum": 0, "maximum": 127, "default": 0},
+                        "loops": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "default": 0,
+                            "description": "Extra repeats (0 plays once).",
+                        },
+                        "volume": {"type": "integer", "minimum": 1, "maximum": 100, "default": 80},
+                    },
+                },
+            ),
+            Tool(
+                name="midi_send",
+                description=(
+                    "Send raw MIDI channel messages to the robot's synth, "
+                    "played at once, as hex bytes. E.g. 'C0 0B' picks "
+                    "vibraphone on channel 1, '90 3C 64' starts middle C, "
+                    "'80 3C 00' stops it, '99 24 7F' hits a kick drum. Notes "
+                    "sound until a note off (or midi_stop)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "hex": {"type": "string", "description": "MIDI bytes in hex, spaces allowed."},
+                        "volume": {"type": "integer", "minimum": 1, "maximum": 100, "default": 80},
+                    },
+                    "required": ["hex"],
+                },
+            ),
+            Tool(
+                name="midi_stop",
+                description="Stop the music on the robot's MIDI synth and release every note.",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="midi_status",
+                description="MIDI synth state: playing or not, position and length in ms, active voices, last error.",
+                inputSchema={"type": "object", "properties": {}},
             ),
             Tool(
                 name="show_text",

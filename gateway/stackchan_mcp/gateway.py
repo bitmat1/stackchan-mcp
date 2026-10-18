@@ -369,6 +369,44 @@ class Gateway:
             return {"ok": False, "error": error.get("message", str(error))}
         return {"ok": True, "bytes": len(gif), **info, "seconds": int(seconds), "device": result}
 
+    async def play_midi(
+        self,
+        source: str = "",
+        notes: str = "",
+        tempo: int = 120,
+        program: int = 0,
+        loops: int = 0,
+        volume: int = 80,
+    ) -> dict:
+        """Play a MIDI file (``source``) or a text melody (``notes``) on the robot's synth.
+
+        Staged on the capture server for one authenticated download, like
+        show_gif; the robot parses and plays it with its General MIDI synth.
+        """
+        from .midi import load_midi_bytes, melody_to_midi
+
+        if self._capture_app is None:
+            return {"ok": False, "error": "gateway_not_started"}
+        try:
+            if notes:
+                data = melody_to_midi(notes, tempo=int(tempo), program=int(program))
+            elif source:
+                data = await load_midi_bytes(source)
+            else:
+                return {"ok": False, "error": "give a MIDI file (midi) or a melody (notes)"}
+        except (ValueError, OSError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+        short_id, token, _sha256 = await stage_avatar_set(self._capture_app, "midi", data)
+        url = f"{self.avatar_set_base_url}/avatar_set/{short_id}"
+        result, error = await self.esp32.call_tool(
+            "self.audio.midi_play",
+            {"url": url, "token": token, "loops": int(loops), "volume": int(volume)},
+        )
+        if error:
+            return {"ok": False, "error": error.get("message", str(error))}
+        return {"ok": True, "bytes": len(data), "device": result}
+
 
 # Singleton gateway instance, shared between stdio server and ESP32 manager
 _gateway: Gateway | None = None

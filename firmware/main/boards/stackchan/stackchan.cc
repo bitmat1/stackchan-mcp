@@ -53,6 +53,7 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include "lvgl_display/gif/gifdec.h"
 #if CONFIG_STACKCHAN_BODY_SENSORS
 #include "body_events.h"
+#include "midi_player.h"
 #include "body_sensors.h"
 #endif
 
@@ -811,6 +812,8 @@ private:
     esp_timer_handle_t overlay_image_timer_ = nullptr;
     esp_timer_handle_t overlay_text_timer_ = nullptr;
     std::atomic<bool> overlay_image_loading_{false};
+    std::atomic<bool> midi_loading_{false};
+    std::string midi_last_error_;
     std::string overlay_image_last_error_;
 
     // Drawing canvas (self.display.canvas): a 320x240 RGB565 canvas on
@@ -5468,6 +5471,90 @@ private:
     }
 #endif
 
+    // ---- MIDI synth (self.audio.midi_*) -----------------------------------
+
+    struct MidiFetchJob {
+        StackChanBoard* board;
+        std::string url;
+        std::string token;
+        int loops;
+        int volume;
+    };
+
+    // Runs on its own task like OverlayImageTask: downloads the MIDI file
+    // from the gateway's one-time staging URL into PSRAM and starts it.
+    static void MidiFetchTask(void* arg) {
+        std::unique_ptr<MidiFetchJob> job(static_cast<MidiFetchJob*>(arg));
+        StackChanBoard* self = job->board;
+        std::string error = self->FetchAndPlayMidi(*job);
+        if (!error.empty()) ESP_LOGW(TAG, "midi_play failed: %s", error.c_str());
+        self->midi_last_error_ = error;
+        self->midi_loading_.store(false);
+        vTaskDelete(nullptr);
+    }
+
+    std::string FetchAndPlayMidi(const MidiFetchJob& job) {
+        static constexpr size_t kMaxMidiBytes = 512 * 1024;
+        auto network = Board::GetInstance().GetNetwork();
+        if (network == nullptr) return "no_network";
+        auto http = network->CreateHttp(0);
+        if (http == nullptr) return "http_open_failed";
+        if (!job.token.empty()) {
+            http->SetHeader("Authorization", (std::string("Bearer ") + job.token).c_str());
+        }
+        if (!http->Open("GET", job.url)) return "http_open_failed";
+        if (http->GetStatusCode() != 200) {
+            http->Close();
+            return "http_status_" + std::to_string(http->GetStatusCode());
+        }
+        size_t size = http->GetBodyLength();
+        if (size == 0 || size > kMaxMidiBytes) {
+            http->Close();
+            return "bad_content_length";
+        }
+        std::unique_ptr<uint8_t, decltype(&heap_caps_free)> buf(
+            static_cast<uint8_t*>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
+            &heap_caps_free);
+        if (!buf) {
+            http->Close();
+            return "psram_oom";
+        }
+        size_t total = 0;
+        while (total < size) {
+            int n = http->Read(reinterpret_cast<char*>(buf.get() + total),
+                               static_cast<int>(std::min<size_t>(4096, size - total)));
+            if (n <= 0) {
+                http->Close();
+                return "read_failed";
+            }
+            total += static_cast<size_t>(n);
+        }
+        http->Close();
+        return MidiPlayer::GetInstance().PlayFile(buf.get(), size, job.loops, job.volume);
+    }
+
+    static bool DecodeHex(const std::string& text, std::vector<uint8_t>& out) {
+        auto nibble = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        int high = -1;
+        for (char c : text) {
+            if (c == ' ' || c == ',' || c == ':') continue;
+            int v = nibble(c);
+            if (v < 0) return false;
+            if (high < 0) {
+                high = v;
+            } else {
+                out.push_back(static_cast<uint8_t>((high << 4) | v));
+                high = -1;
+            }
+        }
+        return high < 0;
+    }
+
     // ---- Screen overlays (show_image / show_text) ------------------------
 
     // Creates or restarts a one-shot timer that runs `fn` on this board.
@@ -7585,6 +7672,94 @@ private:
     void RegisterMcpTools() {
         auto& mcp_server = McpServer::GetInstance();
         ESP_LOGI(TAG, "Registering StackChan MCP tools...");
+
+        mcp_server.AddTool(
+            "self.audio.midi_play",
+            "Download a Standard MIDI File (staged by the gateway) and play it with the General MIDI synth.",
+            PropertyList({
+                Property("url", kPropertyTypeString),
+                Property("token", kPropertyTypeString, std::string("")),
+                Property("loops", kPropertyTypeInteger, 0, 0, 100),
+                Property("volume", kPropertyTypeInteger, 80, 1, 100),
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+                if (midi_loading_.exchange(true)) {
+                    cJSON_AddBoolToObject(root, "ok", false);
+                    cJSON_AddStringToObject(root, "error", "busy: previous MIDI file still loading");
+                    return root;
+                }
+                auto* job = new MidiFetchJob{
+                    this,
+                    properties["url"].value<std::string>(),
+                    properties["token"].value<std::string>(),
+                    properties["loops"].value<int>(),
+                    properties["volume"].value<int>(),
+                };
+                if (xTaskCreate(MidiFetchTask, "midi_fetch", 6144, job, 4, nullptr) != pdPASS) {
+                    delete job;
+                    midi_loading_.store(false);
+                    cJSON_AddBoolToObject(root, "ok", false);
+                    cJSON_AddStringToObject(root, "error", "task_create_failed");
+                    return root;
+                }
+                cJSON_AddBoolToObject(root, "ok", true);
+                cJSON_AddStringToObject(root, "status", "loading");
+                if (!midi_last_error_.empty()) {
+                    cJSON_AddStringToObject(root, "previous_error", midi_last_error_.c_str());
+                }
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.audio.midi_send",
+            "Play raw MIDI channel messages now, as hex bytes (e.g. 'C0 0B 90 3C 64' = vibraphone, middle C on).",
+            PropertyList({
+                Property("hex", kPropertyTypeString),
+                Property("volume", kPropertyTypeInteger, 80, 1, 100),
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+                std::vector<uint8_t> bytes;
+                std::string error;
+                if (!DecodeHex(properties["hex"].value<std::string>(), bytes)) {
+                    error = "hex must be pairs of hex digits";
+                } else {
+                    error = MidiPlayer::GetInstance().Send(bytes.data(), bytes.size(),
+                                                           properties["volume"].value<int>());
+                }
+                cJSON_AddBoolToObject(root, "ok", error.empty());
+                if (!error.empty()) {
+                    cJSON_AddStringToObject(root, "error", error.c_str());
+                } else {
+                    cJSON_AddNumberToObject(root, "bytes", static_cast<double>(bytes.size()));
+                }
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.audio.midi_stop",
+            "Stop the MIDI file and release every note.",
+            PropertyList(),
+            [](const PropertyList&) -> ReturnValue {
+                MidiPlayer::GetInstance().Stop();
+                cJSON* root = cJSON_CreateObject();
+                cJSON_AddBoolToObject(root, "ok", true);
+                return root;
+            });
+
+        mcp_server.AddTool(
+            "self.audio.midi_status",
+            "MIDI synth state: whether a file is playing, its position and length, active voices.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                cJSON* root = MidiPlayer::GetInstance().Status();
+                cJSON_AddBoolToObject(root, "loading", midi_loading_.load());
+                if (!midi_last_error_.empty()) {
+                    cJSON_AddStringToObject(root, "last_error", midi_last_error_.c_str());
+                }
+                return root;
+            });
 
         mcp_server.AddTool(
             "self.display.show_image",

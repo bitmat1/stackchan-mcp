@@ -389,6 +389,11 @@ def pack_assets_simple(target_path, include_path, out_file, assets_path, max_nam
         file_name = os.path.basename(file_path)
         file_size = os.path.getsize(file_path)
 
+        # Pad so each file's data (after the 2-byte prefix) is 4-byte
+        # aligned in the mmapped partition; the table and header ahead of
+        # merged_data are a multiple of 4. The MIDI synth reads the
+        # SoundFont's 16-bit samples in place and needs this.
+        merged_data.extend(b'\x00' * ((-(len(merged_data) + 2)) % 4))
         file_info_list.append((file_name, len(merged_data), file_size, 0, 0))
         # Add 0x5A5A prefix to merged_data
         merged_data.extend(b'\x5A' * 2)

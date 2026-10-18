@@ -904,6 +904,22 @@ bool AudioService::IsIdle() {
     return audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() && audio_testing_queue_.empty();
 }
 
+bool AudioService::PushPcmToPlaybackQueue(std::vector<int16_t>&& pcm) {
+    std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+    audio_queue_cv_.wait(lock, [this]() {
+        return service_stopped_ || audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE;
+    });
+    if (service_stopped_) {
+        return false;
+    }
+    auto task = std::make_unique<AudioTask>();
+    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task->pcm = std::move(pcm);
+    audio_playback_queue_.push_back(std::move(task));
+    audio_queue_cv_.notify_all();
+    return true;
+}
+
 bool AudioService::IsPlaybackIdle() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
     return audio_decode_queue_.empty() && audio_playback_queue_.empty();

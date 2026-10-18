@@ -208,6 +208,8 @@ elseif(CONFIG_BOARD_TYPE_STACKCHAN)
     set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
     set(BUILTIN_ICON_FONT font_awesome_20_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
+    # The General MIDI SoundFont for the MIDI synth (midi_player.cc).
+    set(DEFAULT_ASSETS_EXTRA_FILES "${CMAKE_CURRENT_SOURCE_DIR}/boards/stackchan/assets_extra")
 elseif(CONFIG_BOARD_TYPE_M5STACK_CORE_TAB5)
     set(BOARD_TYPE "m5stack-tab5")
     set(BUILTIN_TEXT_FONT font_puhui_basic_30_4)
@@ -867,6 +869,12 @@ if(CONFIG_BOARD_TYPE_STACKCHAN)
             "${CMAKE_CURRENT_SOURCE_DIR}/../components/feetech_scs")
         message(STATUS "StackChan: using MIT FeetechScs driver, excluding SCServo_lib sources from build")
     endif()
+    # MIDI synth: TinySoundFont renders every sample, so speed over -Os.
+    list(APPEND INCLUDE_DIRS
+        "${CMAKE_CURRENT_SOURCE_DIR}/../components/tinysoundfont")
+    set_source_files_properties(
+        "${STACKCHAN_BOARD_DIR}/midi_player.cc"
+        PROPERTIES COMPILE_OPTIONS "-O2")
     # show_gif decodes every frame with gifdec: speed over the project's -Os.
     set_source_files_properties(
         "${CMAKE_CURRENT_SOURCE_DIR}/display/lvgl_display/gif/gifdec.c"

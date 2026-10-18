@@ -217,8 +217,8 @@ async def stage_avatar_set(
     GC'd after AVATAR_SET_STAGING_TTL_SEC if never fetched.
     """
     # "image" stages a single 320x240 RGB565 frame for show_image, "gif" an
-    # animated GIF for show_gif.
-    if mode not in ("layered", "matrix", "image", "gif"):
+    # animated GIF for show_gif, "midi" a Standard MIDI File for play_midi.
+    if mode not in ("layered", "matrix", "image", "gif", "midi"):
         raise ValueError(f"unknown avatar mode: {mode}")
 
     short_id = secrets.token_hex(8)
