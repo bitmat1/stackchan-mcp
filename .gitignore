@@ -49,3 +49,6 @@ firmware/main/boards/stackchan/avatar_images.local.h
 
 # Local handoff notes (personal details, keep off GitHub)
 docs/HANDOFF.md
+
+# Stack-chan long-term memory (personal details, keep off GitHub)
+voice-session/ROBOT_MEMORY.md
