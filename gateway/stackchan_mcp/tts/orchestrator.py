@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, nullcontext
 from typing import TYPE_CHECKING, Any
@@ -84,6 +85,70 @@ def _prebuffer_s() -> float:
 
 def _wifi_awake_enabled() -> bool:
     return os.getenv(TTS_WIFI_AWAKE_ENV_VAR, "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+#: Set to 0 to synthesise each reply in one piece instead of sentence by
+#: sentence.
+TTS_SENTENCE_STREAM_ENV_VAR = "STACKCHAN_TTS_SENTENCE_STREAM"
+
+#: Sentences shorter than this are joined to the next one, so a lone "Right."
+#: does not become its own choppy clip.
+MIN_SENTENCE_CHARS = 12
+
+_SENTENCE_END = re.compile(r"(?<=[.!?…])\s+|(?<=[。！？])")
+
+
+def _sentence_stream_enabled() -> bool:
+    return os.getenv(TTS_SENTENCE_STREAM_ENV_VAR, "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split ``text`` into sentences, joining very short ones to the next."""
+    pieces = [p.strip() for p in _SENTENCE_END.split(text.strip()) if p and p.strip()]
+    sentences: list[str] = []
+    pending = ""
+    for piece in pieces:
+        pending = f"{pending} {piece}" if pending else piece
+        if len(pending) >= MIN_SENTENCE_CHARS:
+            sentences.append(pending)
+            pending = ""
+    if pending:
+        if sentences:
+            sentences[-1] = f"{sentences[-1]} {pending}"
+        else:
+            sentences.append(pending)
+    return sentences or [text]
+
+
+def _prefetch_segments(
+    segments: list[str],
+    synthesize: Callable[[str], Awaitable[bytes]],
+) -> AsyncIterator[bytes]:
+    """Yield PCM for each segment, synthesising the next one while the
+    current one plays. The first segment starts synthesising at once,
+    while the caller is still playing whatever came before it."""
+    first: asyncio.Future[bytes] = asyncio.ensure_future(synthesize(segments[0]))
+    # If playback fails before the iterator starts, nobody awaits ``first``;
+    # mark its exception as retrieved so asyncio does not log it.
+    first.add_done_callback(lambda f: f.cancelled() or f.exception())
+
+    async def iterate() -> AsyncIterator[bytes]:
+        task: asyncio.Future[bytes] | None = first
+        try:
+            for i in range(len(segments)):
+                assert task is not None
+                pcm = await task
+                task = (
+                    asyncio.ensure_future(synthesize(segments[i + 1]))
+                    if i + 1 < len(segments)
+                    else None
+                )
+                yield pcm
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+
+    return iterate()
 
 #: Delay after the ``tts.stop`` notification before reasserting an
 #: emoji-selected face. Firmware handles stop by scheduling the idle /
@@ -358,27 +423,36 @@ async def synthesize_and_send(
     # MCP layer's narrow exception filter still produces clean error
     # JSON. Validation errors (ValueError) are kept distinct so bad
     # arguments stay separable from operational degradation.
-    try:
-        pcm = await engine.synthesize(
-            tts_text,
-            speaker_id=speaker_id,
-            speaker_name=speaker_name,
-            reference_audio=reference_audio,
-        )
-    except ValueError:
-        raise
-    except Exception as exc:
-        raise RuntimeError(
-            f"TTS engine '{voice}' failed: {exc}"
-        ) from exc
+    async def synthesize_segment(segment: str) -> bytes:
+        try:
+            pcm = await engine.synthesize(
+                segment,
+                speaker_id=speaker_id,
+                speaker_name=speaker_name,
+                reference_audio=reference_audio,
+            )
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"TTS engine '{voice}' failed: {exc}"
+            ) from exc
+        if not pcm:
+            # An engine returning no PCM is a bug, not a runtime condition;
+            # surface it to the caller rather than silently sending zero
+            # frames (which would look like the device "ignored" the call).
+            raise RuntimeError(
+                f"Engine '{voice}' produced no PCM data for the given text."
+            )
+        return pcm
 
-    if not pcm:
-        # An engine returning no PCM is a bug, not a runtime condition;
-        # surface it to the caller rather than silently sending zero
-        # frames (which would look like the device "ignored" the call).
-        raise RuntimeError(
-            f"Engine '{voice}' produced no PCM data for the given text."
-        )
+    # Multi-sentence replies are synthesised one sentence at a time: the
+    # first sentence starts playing while the next is being made, so the
+    # wait before the robot speaks is one sentence's synthesis instead of
+    # the whole reply's.
+    segments = split_sentences(tts_text) if _sentence_stream_enabled() else [tts_text]
+    pcm = await synthesize_segment(segments[0])
+    more_pcm = _prefetch_segments(segments[1:], synthesize_segment) if len(segments) > 1 else None
 
     async def dispatch_face_before_first_frame() -> None:
         nonlocal face_dispatched, face_error
@@ -405,12 +479,18 @@ async def synthesize_and_send(
 
     subtitle = strip_emoji_for_plain_tts(text).strip() if subtitles_enabled() else ""
     if subtitle:
-        # 16 kHz mono s16 PCM = 32 bytes per millisecond.
-        await show_subtitle(gateway.esp32, subtitle, len(pcm) // 32)
+        # 16 kHz mono s16 PCM = 32 bytes per millisecond. With sentence
+        # streaming only the first sentence's length is known, so scale it
+        # by the share of the text it covers.
+        subtitle_ms = len(pcm) // 32
+        if more_pcm is not None:
+            subtitle_ms = subtitle_ms * len(tts_text) // max(1, len(segments[0]))
+        await show_subtitle(gateway.esp32, subtitle, subtitle_ms)
     try:
         result = await send_pcm_audio(
             gateway,
             pcm,
+            more_pcm=more_pcm,
             source_label=f"engine:{voice}",
             before_first_frame=(
                 dispatch_face_before_first_frame if face is not None else None
@@ -422,6 +502,8 @@ async def synthesize_and_send(
             ),
         )
     finally:
+        if more_pcm is not None:
+            await more_pcm.aclose()
         if subtitle:
             await show_subtitle(gateway.esp32, "", 0)
 
@@ -472,8 +554,13 @@ async def send_pcm_audio(
     source_label: str = "external",
     before_first_frame: Callable[[], Awaitable[None]] | None = None,
     after_playback_complete: Callable[[], Awaitable[None]] | None = None,
+    more_pcm: AsyncIterator[bytes] | None = None,
 ) -> dict[str, Any]:
     """Encode mono PCM and push as Opus frames to the connected device.
+
+    ``more_pcm`` optionally yields further PCM segments (at ``source_rate``)
+    that are played straight after ``pcm`` in the same utterance, e.g. the
+    later sentences of a reply still being synthesised.
 
     This is the shared back-half of the TTS pipeline. ``synthesize_and_send``
     delegates here after running its engine; external producers (an HTTP
@@ -619,22 +706,47 @@ async def send_pcm_audio(
             # Front-load the prebuffer: frames scheduled before "now" go
             # out back-to-back, then pacing settles to real time.
             next_send_time = loop.time() - _prebuffer_s()
-            for frame in opus_frames:
-                now = loop.time()
-                if now < next_send_time:
-                    await asyncio.sleep(next_send_time - now)
-                try:
-                    await gateway.esp32.send_audio_frame(frame)
-                except ConnectionError as exc:
-                    # Stop pushing on the first disconnect, but fall
-                    # through to the stop notification (see finally) so
-                    # that *if* the device is somehow still listening
-                    # it returns to idle rather than staying in speaking
-                    # forever.
-                    push_error = exc
-                    break
-                sent += 1
-                next_send_time += frame_period_s
+
+            async def push_frames(frames: list[bytes]) -> None:
+                nonlocal sent, push_error, next_send_time
+                for frame in frames:
+                    now = loop.time()
+                    if now < next_send_time:
+                        await asyncio.sleep(next_send_time - now)
+                    try:
+                        await gateway.esp32.send_audio_frame(frame)
+                    except ConnectionError as exc:
+                        # Stop pushing on the first disconnect, but fall
+                        # through to the stop notification (see finally) so
+                        # that *if* the device is somehow still listening
+                        # it returns to idle rather than staying in speaking
+                        # forever.
+                        push_error = exc
+                        return
+                    sent += 1
+                    next_send_time += frame_period_s
+
+            await push_frames(opus_frames)
+            if more_pcm is not None:
+                async for segment in more_pcm:
+                    if push_error is not None:
+                        break
+                    if source_rate != DEVICE_SAMPLE_RATE:
+                        segment = resample_pcm16_linear(
+                            segment, source_rate, DEVICE_SAMPLE_RATE
+                        )
+                    try:
+                        frames = list(encode_opus_frames(segment))
+                    except Exception as exc:
+                        raise RuntimeError(f"Opus encoding failed: {exc}") from exc
+                    # A segment that arrived late (the device already ran
+                    # dry) restarts pacing from now with a fresh prebuffer
+                    # instead of bursting frames to catch up a stale
+                    # schedule and overflowing the decode queue.
+                    if next_send_time < loop.time():
+                        next_send_time = loop.time() - _prebuffer_s()
+                    opus_frames.extend(frames)
+                    await push_frames(frames)
             playback_complete = push_error is None
         finally:
             try:

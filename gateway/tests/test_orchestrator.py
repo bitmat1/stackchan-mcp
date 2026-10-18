@@ -967,3 +967,54 @@ async def test_pipeline_disconnect_before_tts_start(fake_encode):
             registry=reg,
         )
     assert esp32.tts_states == ["start"]
+
+
+def test_split_sentences_joins_short_pieces():
+    from stackchan_mcp.tts.orchestrator import split_sentences
+
+    assert split_sentences("Right. The willow likes wet soil. Water it often!") == [
+        "Right. The willow likes wet soil.",
+        "Water it often!",
+    ]
+    assert split_sentences("hello") == ["hello"]
+    assert split_sentences("One sentence only, no break") == ["One sentence only, no break"]
+    assert split_sentences("A long first sentence here. Ok.") == ["A long first sentence here. Ok."]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_streams_sentences_in_one_utterance(fake_encode):
+    bytes_per_frame = DEVICE_SAMPLE_RATE * DEVICE_FRAME_DURATION_MS // 1000 * 2
+    engine = _PCMEngine(b"\x00" * bytes_per_frame * 2)
+    reg = EngineRegistry()
+    reg.register(engine)
+    esp32 = _FakeESP32()
+
+    result = await synthesize_and_send(
+        {"text": "The first sentence is here. And then a second one.", "voice": "voicevox"},
+        gateway=_FakeGateway(esp32),
+        registry=reg,
+    )
+
+    assert [text for text, _ in engine.calls] == [
+        "The first sentence is here.",
+        "And then a second one.",
+    ]
+    assert esp32.tts_states == ["start", "stop"]
+    assert len(esp32.frames) == 4
+    assert result["frame_count"] == 4
+
+
+@pytest.mark.asyncio
+async def test_pipeline_sentence_stream_can_be_disabled(fake_encode, monkeypatch):
+    monkeypatch.setenv("STACKCHAN_TTS_SENTENCE_STREAM", "0")
+    engine = _PCMEngine(b"\x00" * 3840)
+    reg = EngineRegistry()
+    reg.register(engine)
+
+    await synthesize_and_send(
+        {"text": "The first sentence is here. And then a second one.", "voice": "voicevox"},
+        gateway=_FakeGateway(_FakeESP32()),
+        registry=reg,
+    )
+
+    assert len(engine.calls) == 1

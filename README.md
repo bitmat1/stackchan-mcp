@@ -30,14 +30,14 @@ This is a fork of [kisaragi-mochi/stackchan-mcp](https://github.com/kisaragi-moc
 - **Screen extras:** clock screensaver, Wi-Fi and battery icons, scrolling subtitles, a ticker, `show_image` / `show_text` overlays and `show_gif` (plays a GIF from PSRAM at about 14 fps).
 - **Body sensors:** BMI270 IMU and LTR-553 proximity drivers that raise picked up / put down / tipped over / shaken and near / far events (ignoring the robot's own head motion), with `get_motion` and `get_proximity` tools. A body event wakes the robot from the screensaver; it powers off after 10 minutes idle.
 - **Wake word:** custom wake word ("hey robot") from precomputed phonemes, without the ~600 KB Flite lexicon; repeat-wake fix.
-- **Listening:** a tapped listening turn ends by itself after a stretch of silence. A double knock felt by the IMU also starts listening, as the RT ver. has no head-touch sensor (`set_knock_threshold`, and `peak_jolt_g` in `get_motion` for tuning). Optionally a spoken cue ("What do you want?") replaces the beep, and the mic opens only after it has played (there is no echo cancellation).
+- **Listening:** a tapped listening turn ends by itself after 1.2 s of silence. A double knock felt by the IMU also starts listening, as the RT ver. has no head-touch sensor (`set_knock_threshold`, and `peak_jolt_g` in `get_motion` for tuning). Optionally a spoken cue ("What do you want?") replaces the beep, and the mic opens only after it has played (there is no echo cancellation).
 - **Listen after a question:** a gateway `listen` start with `"auto_stop": true` waits for the speech to finish, then listens like a tap and ends on silence.
 - **Drawing canvas:** a 320x240 canvas above the face (`self.display.canvas` / `canvas_hide`) that draws a batch of up to 256 pixels, lines, rectangles, circles and text in one call.
 - **Status and fixes:** device status reports Wi-Fi signal, free RAM and PSRAM and uptime; the BMI270 is soft-reset and retried after an ESP32-only reset; diagnostic tools moved behind `CONFIG_STACKCHAN_DIAGNOSTIC_TOOLS`; one-line tool descriptions.
 
 **Gateway (`gateway/`)**
 
-- **Local voice:** macOS `say` and Kokoro text-to-speech engines, speech pacing and prebuffering, and subtitles while speaking.
+- **Local voice:** macOS `say` and Kokoro text-to-speech engines, speech pacing and prebuffering, and subtitles while speaking. Replies are synthesised sentence by sentence, so the first sentence plays while the rest are made (`STACKCHAN_TTS_SENTENCE_STREAM=0` turns it off).
 - **Voice channel:** speech the robot hears (tap, knock or wake word) is transcribed by local Whisper and sent to a Claude Code session as a channel message, through a stdio channel bridge to the running HTTP gateway (see `voice-session/`). The bridge reconnects if the gateway restarts.
 - **`say` with `listen_after`:** after asking a question the robot listens straight away, so the person can answer without tapping.
 - **Filler filter:** transcripts that Whisper invents on silence, such as "Thanks for watching!", are dropped instead of being sent to the session.
