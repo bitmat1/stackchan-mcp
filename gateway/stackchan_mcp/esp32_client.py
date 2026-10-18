@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 
 # Timeout for waiting for ESP32 responses
 RESPONSE_TIMEOUT = 10.0
+# take_photo waits for the device's capture upload, which can take ~15 s
+# over a remote tunnel such as Tailscale Funnel.
+PHOTO_RESPONSE_TIMEOUT = 30.0
+_TOOL_RESPONSE_TIMEOUTS = {"self.camera.take_photo": PHOTO_RESPONSE_TIMEOUT}
 WEBSOCKET_PING_INTERVAL_S = 20
 WEBSOCKET_PING_TIMEOUT_S = 20
 
@@ -196,7 +200,10 @@ class ESP32Connection:
         return self._request_id
 
     async def send_mcp_request(
-        self, method: str, params: dict[str, Any]
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float = RESPONSE_TIMEOUT,
     ) -> tuple[Any, dict[str, Any] | None]:
         """Send an MCP request to ESP32 and wait for response.
 
@@ -213,7 +220,7 @@ class ESP32Connection:
 
         try:
             await self._ws_send(json.dumps(message))
-            response = await asyncio.wait_for(future, timeout=RESPONSE_TIMEOUT)
+            response = await asyncio.wait_for(future, timeout=timeout)
             return parse_jsonrpc_response(response)
         except asyncio.CancelledError:
             self._pending.pop(req_id, None)
@@ -284,7 +291,9 @@ class ESP32Connection:
         if name == _SET_AVATAR_TOOL:
             self._avatar_render_sent = True
         return await self.send_mcp_request(
-            "tools/call", {"name": name, "arguments": arguments}
+            "tools/call",
+            {"name": name, "arguments": arguments},
+            timeout=_TOOL_RESPONSE_TIMEOUTS.get(name, RESPONSE_TIMEOUT),
         )
 
     async def send_avatar_set_fetch(
