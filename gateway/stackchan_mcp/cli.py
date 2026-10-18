@@ -1003,6 +1003,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "channel":
         from .channel_bridge import run_channel_bridge
 
+        # The bridge needs STACKCHAN_TOKEN from .env to reach a daemon
+        # that requires bearer auth.
+        _load_dotenv()
         run_channel_bridge()
         return
 
