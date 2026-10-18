@@ -1154,8 +1154,8 @@ async def test_list_tools_move_head_declares_recommended_pitch_range(monkeypatch
     ("speed", "expected_dps"),
     [
         ("low", 30),
-        ("mid", 120),
-        ("high", 240),
+        ("mid", 70),
+        ("high", 160),
         (None, None),
         (200, 200),
         (1, 1),
@@ -1307,7 +1307,7 @@ async def test_move_head_accepts_pitch_inside_recommended(monkeypatch, pitch):
     assert len(calls) == 1
     name, arguments = calls[0]
     assert name == "self.robot.set_head_angles"
-    assert arguments == {"yaw": 0, "pitch": pitch}
+    assert arguments == {"yaw": 0, "pitch": pitch, "speed_dps": 70}
 
     payload = json.loads(result.root.content[0].text)
     assert "error" not in payload
@@ -1325,14 +1325,14 @@ async def test_move_head_speed_mid_forwards_speed_dps(monkeypatch):
     assert len(calls) == 1
     name, arguments = calls[0]
     assert name == "self.robot.set_head_angles"
-    assert arguments == {"yaw": 10, "pitch": 45, "speed_dps": 120}
+    assert arguments == {"yaw": 10, "pitch": 45, "speed_dps": 70}
 
     payload = json.loads(result.root.content[0].text)
     assert "error" not in payload
 
 
 @pytest.mark.asyncio
-async def test_move_head_without_speed_omits_speed_dps(monkeypatch):
+async def test_move_head_without_speed_uses_mid(monkeypatch):
     calls = _make_fake_gateway(monkeypatch)
     server = create_server()
 
@@ -1343,7 +1343,7 @@ async def test_move_head_without_speed_omits_speed_dps(monkeypatch):
     assert len(calls) == 1
     name, arguments = calls[0]
     assert name == "self.robot.set_head_angles"
-    assert arguments == {"yaw": 10, "pitch": 45}
+    assert arguments == {"yaw": 10, "pitch": 45, "speed_dps": 70}
 
     payload = json.loads(result.root.content[0].text)
     assert "error" not in payload

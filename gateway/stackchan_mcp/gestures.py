@@ -35,6 +35,15 @@ GESTURES: dict[str, list[Step]] = {
 
 GESTURE_NAMES = tuple(GESTURES)
 
+# Every gesture's speeds are multiplied by this, so they can all be slowed
+# down together for smoother motion.
+GESTURE_SPEED_SCALE = 0.6
+
+# Every step but the last (the return to the start pose) is raised by this
+# many degrees, so gestures play higher up, but never above GESTURE_PITCH_MAX.
+GESTURE_PITCH_LIFT = 10
+GESTURE_PITCH_MAX = 85
+
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
@@ -56,9 +65,13 @@ async def run_gesture(gateway: "Gateway", name: str, intensity: float = 1.0) -> 
     pitch0 = clamp_pitch(pitch0)
 
     yaw, pitch = yaw0, pitch0
-    for dyaw, dpitch, dps, hold_ms in steps:
+    for i, (dyaw, dpitch, dps, hold_ms) in enumerate(steps):
+        dps = max(15, round(dps * GESTURE_SPEED_SCALE))
+        lift = GESTURE_PITCH_LIFT if i < len(steps) - 1 else 0
         target_yaw = round(_clamp(yaw0 + dyaw * intensity, -90, 90))
-        target_pitch = round(clamp_pitch(pitch0 + dpitch * intensity))
+        target_pitch = round(clamp_pitch(pitch0 + dpitch * intensity + lift))
+        if lift:
+            target_pitch = min(target_pitch, max(GESTURE_PITCH_MAX, round(pitch0)))
         await _call_device_tool(
             gateway,
             "self.robot.set_head_angles",

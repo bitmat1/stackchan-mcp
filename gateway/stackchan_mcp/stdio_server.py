@@ -83,14 +83,17 @@ STACKCHAN_JSONL_INSTRUCTIONS = (
 
 PRESET_DPS = {
     "low": 30,
-    "mid": 120,
-    "high": 240,
+    "mid": 70,
+    "high": 160,
 }
+# Used when move_head is called without a speed. Without it the firmware
+# moves any distance in a fixed 600 ms, which makes big turns jerky.
+DEFAULT_SPEED = "mid"
 SPEED_DPS_MAX = 10000
 SPEED_DESCRIPTION = """speed (optional): How fast to move the head.
   - "low"  — slow, deliberate, ~30°/s. Good for curious tilts or gentle look-toward.
-  - "mid"  — default natural turn, ~120°/s. Use for conversational eye contact.
-  - "high" — quick reaction, ~240°/s. Use for surprise / double-take.
+  - "mid"  — default natural turn, ~70°/s. Use for conversational eye contact.
+  - "high" — quick reaction, ~160°/s. Use for surprise / double-take.
   - Or a raw degrees-per-second integer if you need a specific value."""
 
 _active_session: Any | None = None
@@ -1181,7 +1184,7 @@ async def _dispatch_mcp_tool_inner(
                 )
             ]
         try:
-            speed_dps = _resolve_speed_dps(arguments.get("speed"))
+            speed_dps = _resolve_speed_dps(arguments.get("speed", DEFAULT_SPEED))
         except (TypeError, ValueError) as exc:
             return [
                 TextContent(
