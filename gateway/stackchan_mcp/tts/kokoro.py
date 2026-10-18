@@ -109,7 +109,11 @@ class KokoroEngine(TTSEngine):
             if isinstance(speaker_name, str) and speaker_name
             else os.getenv("STACKCHAN_KOKORO_VOICE") or DEFAULT_KOKORO_VOICE
         )
-        lang = os.getenv("STACKCHAN_KOKORO_LANG") or DEFAULT_KOKORO_LANG
+        # American voices (af_ / am_) need American pronunciation; a
+        # STACKCHAN_KOKORO_LANG override still wins.
+        lang = os.getenv("STACKCHAN_KOKORO_LANG") or (
+            "en-us" if voice[:1] == "a" else DEFAULT_KOKORO_LANG
+        )
         speed = float(os.getenv("STACKCHAN_KOKORO_SPEED") or 1.0)
 
         kokoro = await self._ensure_loaded()
