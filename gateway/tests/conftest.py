@@ -1,5 +1,7 @@
 """Pytest configuration."""
 
+import os
+
 import pytest
 
 
@@ -15,6 +17,20 @@ def pytest_collection_modifyitems(config, items):
 def asyncio_test(item):
     """Check if test is async."""
     return hasattr(item, "function") and hasattr(item.function, "__wrapped__")
+
+
+@pytest.fixture(autouse=True)
+def _clear_gateway_env(monkeypatch):
+    """Drop gateway settings inherited from the shell.
+
+    A session started by the Stack-chan app inherits the gateway's .env
+    (TTS engine, pitch limits, voice channel...), which would override
+    the defaults the tests expect. Defined first so the fixtures below
+    set their variables after the clear.
+    """
+    for name in list(os.environ):
+        if name.startswith(("STACKCHAN_", "VISION_")):
+            monkeypatch.delenv(name)
 
 
 @pytest.fixture(autouse=True)
