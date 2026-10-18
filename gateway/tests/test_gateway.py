@@ -121,15 +121,18 @@ def test_vision_url_follows_robot_facing_address(monkeypatch):
     assert gw.avatar_set_base_url == "http://192.0.2.67:8766"
 
 
-def test_explicit_vision_url_beats_robot_facing_address(monkeypatch):
+def test_robot_facing_address_beats_explicit_vision_url(monkeypatch):
+    """A robot on the LAN fetches over the LAN, not back in through Funnel."""
     monkeypatch.setenv("VISION_URL", "https://stackchan.example.ts.net:8443/capture")
+    monkeypatch.setenv("CAPTURE_PORT", "8766")
 
     gw = Gateway()
     monkeypatch.setattr(
         type(gw.esp32), "device_facing_host", property(lambda self: "192.0.2.67")
     )
 
-    assert gw.vision_url == "https://stackchan.example.ts.net:8443/capture"
+    assert gw.vision_url == "http://192.0.2.67:8766/capture"
+    assert gw.avatar_set_base_url == "http://192.0.2.67:8766"
 
 
 def test_vision_token_prefers_explicit_token(monkeypatch):

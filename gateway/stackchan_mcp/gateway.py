@@ -44,20 +44,28 @@ class Gateway:
     def vision_url(self) -> str:
         """URL for ESP32 to POST captured photos to.
 
-        VISION_URL can be set to a complete public capture URL for remote
-        access setups such as Tailscale Funnel. Otherwise VISION_HOST should
-        be the LAN IP of the host running this gateway, as seen from the ESP32
-        (e.g. something like 192.168.x.y on a typical home network). Falls
+        While the robot is connected over the LAN, the address its WebSocket
+        reached is used. Otherwise VISION_URL can be set to a complete public
+        capture URL for remote access setups such as Tailscale Funnel, or
+        VISION_HOST to the LAN IP of the host running this gateway, as seen
+        from the ESP32 (e.g. something like 192.168.x.y on a typical home
+        network). Falls
         back to "127.0.0.1" with a warning if unset; in that case the ESP32
         will not be able to reach the capture endpoint over the network.
         """
+        port = int(os.getenv("CAPTURE_PORT", "8766"))
+        # A robot on the LAN fetches over the LAN: Tailscale Funnel drops
+        # connections that start on the gateway's own network. Through
+        # Funnel the WebSocket arrives on loopback, so this is None.
+        facing_host = self.esp32.device_facing_host
+        if facing_host:
+            return f"http://{facing_host}:{port}/capture"
+
         explicit_url = os.getenv("VISION_URL")
         if explicit_url:
             return explicit_url
 
-        # The address the robot's WebSocket arrived on beats a configured
-        # VISION_HOST, which goes stale when DHCP hands the Mac a new IP.
-        host = self.esp32.device_facing_host or os.getenv("VISION_HOST")
+        host = os.getenv("VISION_HOST")
         if not host:
             logger.warning(
                 "VISION_URL/VISION_HOST not set; defaulting to 127.0.0.1. "
@@ -66,7 +74,6 @@ class Gateway:
                 "set to a full capture URL."
             )
             host = "127.0.0.1"
-        port = int(os.getenv("CAPTURE_PORT", "8766"))
         return f"http://{host}:{port}/capture"
 
     @property
