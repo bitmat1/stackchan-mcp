@@ -1040,6 +1040,15 @@ async def _dispatch_mcp_tool_inner(
             ]
         return [TextContent(type="text", text=json.dumps(result))]
 
+    if name == "record_audio":
+        from .tuning import record_audio
+
+        try:
+            result = await record_audio(arguments, gateway=gateway)
+        except (ValueError, RuntimeError) as exc:
+            return [TextContent(type="text", text=json.dumps({"error": str(exc)}))]
+        return [TextContent(type="text", text=json.dumps(result))]
+
     if name == "show_image":
         source = arguments.get("image", "")
         if not isinstance(source, str) or not source:
@@ -2331,6 +2340,21 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                 name="midi_status",
                 description="MIDI synth state: playing or not, position and length in ms, active voices, last error.",
                 inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="record_audio",
+                description=(
+                    "Record the robot's microphone to a WAV file on this "
+                    "computer (16 kHz mono 16-bit) and return its path, for "
+                    "measuring sound rather than transcribing speech."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "duration_ms": {"type": "integer", "minimum": 100, "maximum": 30000, "default": 1000},
+                        "path": {"type": "string", "description": "Where to save the WAV. Default: a temp file."},
+                    },
+                },
             ),
             Tool(
                 name="show_text",
