@@ -28,3 +28,15 @@ def test_matches_firmware_names():
     ).read_text()
     for name in BASE_FACES + EXTENDED_FACES:
         assert f'{{"{name}",' in src, name
+
+
+def test_tracks_face_and_style(tmp_path, monkeypatch):
+    from stackchan_mcp import faces as f
+
+    monkeypatch.setattr(f, "_STATE_PATH", tmp_path / "face.json")
+    f.note_device_call("self.display.set_face_style", {"style": "hal"})
+    f.note_device_call("self.display.set_avatar", {"face": "angry"})
+    f.note_device_call("self.display.set_avatar", {"face": "off"})
+    f.note_device_call("self.robot.set_head_angles", {"yaw": 0})
+    assert f.current_face() == {"face": "angry", "style": "hal"}
+    assert "hal" in (tmp_path / "face.json").read_text()

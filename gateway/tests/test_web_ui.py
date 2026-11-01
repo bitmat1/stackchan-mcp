@@ -130,3 +130,27 @@ def test_brain_routes_switch_and_report(monkeypatch, tmp_path):
             assert client.post("/api/brain/ask", json={}).status_code == 400
     finally:
         brain._override.clear()
+
+
+def test_tuner_state_round_trips():
+    client, _seen = _client()
+    assert client.get("/api/tuner").json() == {}
+    assert client.post("/api/tuner", json={"title": "Patch", "press": 3}).json() == {"ok": True}
+    assert client.get("/api/tuner").json() == {"title": "Patch", "press": 3}
+    assert client.post("/api/tuner", content="[]").status_code == 400
+
+
+def test_face_image_served_and_paths_contained():
+    client, _seen = _client()
+    assert client.get("/ui/faces/bender-angry.png").headers["content-type"] == "image/png"
+    assert client.get("/ui/faces/missing.png").status_code == 404
+    assert client.get("/ui/faces/..%2findex.html").status_code == 404
+
+
+def test_every_face_has_an_image():
+    from stackchan_mcp import faces
+    from stackchan_mcp.web_ui import WEB_DIR
+
+    for style in faces.FACE_STYLES:
+        for face in faces.BASE_FACES + faces.EXTENDED_FACES:
+            assert (WEB_DIR / "faces" / f"{style}-{face}.png").is_file()

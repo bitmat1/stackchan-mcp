@@ -106,6 +106,23 @@ section.min .body { display: none; }
 .timer.soon .left { color: var(--accent); }
 .timer .meta { grid-column: 1; font-size: 12px; color: var(--muted); min-width: 0; overflow-wrap: anywhere; }
 .timer button { grid-column: 2; grid-row: 1 / span 2; padding: 4px 8px; font-size: 13px; }
+#liveSec .live { display: grid; grid-template-columns: minmax(200px, 320px) 1fr; gap: 16px; align-items: stretch; }
+@media (max-width: 640px) { #liveSec .live { grid-template-columns: 1fr; } }
+#liveFace { width: 100%; aspect-ratio: 4 / 3; background: #000; border-radius: 8px; display: block; }
+#tuner { background: #000; color: #fff; border-radius: 8px; padding: 10px 24px 14px; text-align: center; font-variant-numeric: tabular-nums; }
+#tunerTop { display: flex; justify-content: space-between; font-size: 14px; color: #9a9aa2; min-height: 22px; }
+#tunerCents { font-weight: 700; font-size: 20px; }
+#tunerNote { font: 700 clamp(64px, 11vw, 112px)/1 system-ui, sans-serif; color: #9a9aa2; }
+#tunerHz { font: 700 clamp(30px, 5vw, 48px)/1.2 system-ui, sans-serif; margin-top: 12px; }
+#tunerAvg { font-size: 18px; color: #40a0ff; min-height: 24px; }
+#meter { position: relative; height: 54px; margin: 10px 0 0; border-top: 2px solid #fff; }
+#meter .zone { position: absolute; left: 45%; width: 10%; top: 0; bottom: 14px; background: #124d24; }
+#meter .tick { position: absolute; top: -12px; width: 2px; height: 10px; background: #fff; transform: translateX(-1px); }
+#meter .tick.big { top: -18px; height: 16px; }
+#meter .lab { position: absolute; bottom: -4px; font-size: 12px; color: #9a9aa2; transform: translateX(-50%); }
+#needle { position: absolute; top: -8px; bottom: 14px; left: 50%; width: 6px; transform: translateX(-3px); background: #9a9aa2; transition: left .25s; display: none; }
+#avgMark { position: absolute; bottom: 2px; left: 50%; width: 0; height: 0; transform: translateX(-7px); display: none;
+  border-left: 7px solid transparent; border-right: 7px solid transparent; border-bottom: 10px solid #40a0ff; transition: left .25s; }
 .hint { font-size: 12px; color: var(--muted); margin: 0 0 10px; }
 </style>
 </head>
@@ -118,6 +135,23 @@ section.min .body { display: none; }
   <button id="themeBtn" title="Toggle light/dark">◐</button>
 </header>
 <main>
+  <section class="wide" id="liveSec">
+    <h2>Live</h2>
+    <div class="live">
+      <img id="liveFace" alt="The robot's current face">
+      <div id="tuner">
+        <div id="tunerTop"><span id="tunerTitle">No tuning test running</span><span id="tunerCents"></span></div>
+        <div id="tunerNote">--</div>
+        <div id="meter">
+          <div class="zone"></div>
+          <div id="needle"></div>
+          <div id="avgMark"></div>
+        </div>
+        <div id="tunerHz">&nbsp;</div>
+        <div id="tunerAvg"></div>
+      </div>
+    </div>
+  </section>
   <section>
     <h2>Brain</h2>
     <p class="hint">Who answers when you talk to the robot: Claude (needs the Claude voice session) or a local Ollama model (no internet needed).</p>
@@ -830,8 +864,64 @@ $("askBtn").onclick = async (e) => {
   finally { e.target.disabled = false; }
 };
 
+// Live face and tuner
+async function refreshFace() {
+  try {
+    const f = await api("/api/face");
+    const src = `/ui/faces/${f.style}-${f.face}.png`;
+    if ($("liveFace").getAttribute("src") !== src) $("liveFace").src = src;
+    $("liveFace").alt = `${f.style}, ${f.face}`;
+    if (document.activeElement !== $("faceStyle")) $("faceStyle").value = f.style;
+  } catch {}
+}
+
+function buildMeter() {
+  for (let c = -50; c <= 50; c += 10) {
+    const pos = c + 50;
+    const tick = document.createElement("div");
+    tick.className = c % 50 === 0 ? "tick big" : "tick";
+    tick.style.left = `${pos}%`;
+    $("meter").appendChild(tick);
+    if (c % 25 === 0 || c % 50 === 0) {
+      const lab = document.createElement("div");
+      lab.className = "lab";
+      lab.style.left = `${pos}%`;
+      lab.textContent = c > 0 ? `+${c}` : `${c}`;
+      $("meter").appendChild(lab);
+    }
+  }
+}
+
+const meterPos = cents => `${Math.max(0, Math.min(100, cents + 50))}%`;
+
+async function refreshTuner() {
+  let t;
+  try { t = await api("/api/tuner"); } catch { return; }
+  if (!t.title) return;
+  const r = t.reading, s = t.stats || {};
+  const colour = !r ? "#9a9aa2" : Math.abs(r.cents) <= 5 ? "#30d060" : Math.abs(r.cents) <= 20 ? "#ffb020" : "#ff4040";
+  $("tunerTitle").textContent = t.active ? `${t.title}  ${t.press}/${t.presses}` : `${t.title} (finished)`;
+  $("tunerNote").textContent = r ? r.note : "--";
+  $("tunerNote").style.color = colour;
+  $("tunerHz").textContent = r ? `${r.frequency.toFixed(2)} Hz` : "no pitch";
+  $("tunerCents").textContent = r ? `${r.cents >= 0 ? "+" : ""}${r.cents.toFixed(1)} cents` : "";
+  $("tunerCents").style.color = colour;
+  $("needle").style.display = r ? "block" : "none";
+  if (r) { $("needle").style.left = meterPos(r.cents); $("needle").style.background = colour; }
+  const hasAvg = s.mean_cents !== undefined;
+  $("avgMark").style.display = hasAvg ? "block" : "none";
+  if (hasAvg) $("avgMark").style.left = meterPos(s.mean_cents);
+  $("tunerAvg").textContent = hasAvg
+    ? `average ${s.mean_cents >= 0 ? "+" : ""}${s.mean_cents.toFixed(1)} cents  \u00b1${s.stderr_cents.toFixed(1)}  (${s.valid} steady)` : "";
+}
+
 // Boot
 (async () => {
+  buildMeter();
+  refreshFace();
+  setInterval(refreshFace, 1000);
+  refreshTuner();
+  setInterval(refreshTuner, 700);
   loadBrain();
   try { launcher = await api("/api/launcher"); } catch {}
   pollActivity();

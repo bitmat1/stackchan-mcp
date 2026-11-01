@@ -10,6 +10,10 @@ Endpoints:
     GET  /ui                  the control panel page
     GET  /api/tools           tool names, descriptions and input schemas
     GET  /api/timers          pending timers, reminders and alarms
+    GET  /api/face            the face and style last sent to the robot
+    GET  /api/tuner           the tuning test's latest reading
+    POST /api/tuner           scripts/tuning_test.py publishes readings here
+    GET  /ui/faces/{file}     the robot's faces, rendered by its own code
     POST /api/tool/{name}     run a tool; JSON body = tool arguments
 
 Results come back as ``{"content": [...]}`` where each item is either
@@ -31,10 +35,10 @@ from typing import Any, Awaitable, Callable
 import jsonschema
 from mcp.types import ImageContent, ListToolsRequest, TextContent
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
-from . import activity, brain, timers
+from . import activity, brain, faces, timers
 from .queue import CommandQueue, QueueFull, QueueItem
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -128,6 +132,7 @@ def build_web_routes(
     gateway: Any = None,
 ) -> list[Route]:
     tools_cache: dict[str, Any] = {}
+    tuner_state: dict[str, Any] = {}
 
     async def load_tools() -> dict[str, Any]:
         if not tools_cache:
@@ -308,8 +313,35 @@ def build_web_routes(
         asyncio.get_running_loop().call_later(0.3, os.kill, os.getpid(), signal.SIGTERM)
         return JSONResponse({"ok": True})
 
+    async def get_face(_request: Request) -> JSONResponse:
+        return JSONResponse(faces.current_face())
+
+    async def get_tuner(_request: Request) -> JSONResponse:
+        return JSONResponse(tuner_state)
+
+    async def set_tuner(request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "expected a JSON object"}, status_code=400)
+        tuner_state.clear()
+        tuner_state.update(body)
+        return JSONResponse({"ok": True})
+
+    async def face_image(request: Request) -> Response:
+        path = WEB_DIR / "faces" / Path(request.path_params["file"]).name
+        if path.suffix != ".png" or not path.is_file():
+            return Response(status_code=404)
+        return FileResponse(path, headers={"Cache-Control": "max-age=3600"})
+
     return [
         Route("/ui", endpoint=page, methods=["GET"]),
+        Route("/ui/faces/{file}", endpoint=face_image, methods=["GET"]),
+        Route("/api/face", endpoint=get_face, methods=["GET"]),
+        Route("/api/tuner", endpoint=get_tuner, methods=["GET"]),
+        Route("/api/tuner", endpoint=set_tuner, methods=["POST"]),
         Route("/api/gateway/shutdown", endpoint=shutdown, methods=["POST"]),
         Route("/api/activity", endpoint=get_activity, methods=["GET"]),
         Route("/api/health", endpoint=get_health, methods=["GET"]),

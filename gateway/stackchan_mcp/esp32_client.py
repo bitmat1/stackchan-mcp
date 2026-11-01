@@ -22,6 +22,7 @@ from websockets.asyncio.server import ServerConnection
 
 from . import activity
 from .audio_input_hook import push_audio_capture
+from .faces import note_device_call
 from .voice_channel import transcribe_and_notify, voice_channel_enabled
 from .audio_stream import (
     handle_audio_frame,
@@ -290,6 +291,7 @@ class ESP32Connection:
         """Call a tool on ESP32."""
         if name == _SET_AVATAR_TOOL:
             self._avatar_render_sent = True
+        note_device_call(name, arguments)
         return await self.send_mcp_request(
             "tools/call",
             {"name": name, "arguments": arguments},
