@@ -922,10 +922,12 @@ class ESP32Manager:
         """Initialize MCP session with a newly connected device."""
         vision_url = self._vision_url
         facing = _facing_host(connection)
-        # VISION_URL (remote access) is used as given; a LAN capture URL
-        # follows the address this robot actually reached us on.
-        if vision_url and facing and not os.getenv("VISION_URL"):
-            vision_url = _with_host(vision_url, facing)
+        # A robot on the LAN uploads over the LAN: Tailscale Funnel drops
+        # connections that start on the gateway's own network. Through
+        # Funnel the WebSocket arrives on loopback, so VISION_URL is kept.
+        if vision_url and facing:
+            port = int(os.getenv("CAPTURE_PORT", "8766"))
+            vision_url = f"http://{facing}:{port}/capture"
         if await connection.initialize(
             vision_url=vision_url,
             vision_token=self._vision_token,
