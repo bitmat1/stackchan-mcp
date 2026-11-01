@@ -723,6 +723,7 @@ private:
     // Board-local listening cue shown above the full-screen avatar layer.
     lv_obj_t* listening_indicator_ = nullptr;
     lv_obj_t* listening_indicator_dot_ = nullptr;
+    lv_obj_t* listening_border_ = nullptr;
     std::atomic<bool> listening_indicator_visible_{false};
     static constexpr int LISTENING_INDICATOR_DOT_SIZE_PX = 14;
 
@@ -3156,7 +3157,34 @@ private:
         lv_obj_move_foreground(listening_indicator_);
     }
 
+    // Red border round the whole screen while the microphone is recording,
+    // on lv_layer_top() so it stays above images, text and the canvas.
+    void SetListeningBorderVisibleLocked(bool visible) {
+        if (listening_border_ == nullptr) {
+            if (!visible) return;
+            listening_border_ = lv_obj_create(lv_layer_top());
+            if (listening_border_ == nullptr) return;
+            lv_obj_set_size(listening_border_, LV_PCT(100), LV_PCT(100));
+            lv_obj_center(listening_border_);
+            lv_obj_clear_flag(listening_border_, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(listening_border_, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_radius(listening_border_, 0, 0);
+            lv_obj_set_style_bg_opa(listening_border_, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_color(listening_border_, lv_color_hex(0xFF0000), 0);
+            lv_obj_set_style_border_width(listening_border_, 10, 0);
+            lv_obj_set_style_border_opa(listening_border_, LV_OPA_COVER, 0);
+            lv_obj_set_style_pad_all(listening_border_, 0, 0);
+        }
+        if (visible) {
+            lv_obj_clear_flag(listening_border_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(listening_border_);
+        } else {
+            lv_obj_add_flag(listening_border_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
     void SetListeningIndicatorVisibleLocked(bool visible) {
+        SetListeningBorderVisibleLocked(visible);
         if (visible) {
             if (!EnsureListeningIndicatorObjectLocked()) {
                 listening_indicator_visible_.store(false, std::memory_order_release);
